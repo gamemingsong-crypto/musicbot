@@ -2,39 +2,18 @@ import discord
 from discord.ext import commands
 import wavelink
 import os
-import time
-import base64
+import re
+import json
 import aiohttp
 from dotenv import load_dotenv
 
 # โหลดตัวแปรลับจาก .env 
 load_dotenv()
 
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-
-# ==================== 0. ระบบเชื่อมต่อ Spotify API ====================
-# แคช token ไว้ใช้ซ้ำ (ไม่ต้องขอใหม่ทุกครั้งที่มีคนสั่งเพลง)
-_spotify_token_cache = {"token": None, "expires_at": 0}
-
-
-async def get_spotify_token(session: aiohttp.ClientSession) -> str:
-    """ขอ (หรือใช้ token เดิมที่แคชไว้) Access Token จาก Spotify"""
-    if _spotify_token_cache["token"] and time.time() < _spotify_token_cache["expires_at"]:
-        return _spotify_token_cache["token"]
-
-    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
-    async with session.post(
-        "https://accounts.spotify.com/api/token",
-        headers={"Authorization": f"Basic {creds}"},
-        data={"grant_type": "client_credentials"},
-    ) as r:
-        data = await r.json()
-        token = data["access_token"]
-        # เผื่อเวลาหมดอายุไว้ล่วงหน้า 60 วินาที กันเคส token หมดอายุพอดีตอนใช้งาน
-        _spotify_token_cache["token"] = token
-        _spotify_token_cache["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
-        return token
+# ==================== 0. ระบบดึงข้อมูลเพลงจาก Spotify (ไม่ใช้ Official API) ====================
+# ใช้หน้า Embed สาธารณะของ Spotify (เหมือนที่เว็บอื่นใช้ฝัง preview เพลง)
+# ข้อดี: ไม่ต้องมี Client ID/Secret และไม่ต้องมีบัญชี Spotify Premium เลย
+# ข้อควรรู้: เป็นการอ่านโครงสร้างหน้าเว็บสาธารณะ ถ้า Spotify เปลี่ยนโครงสร้างหน้าเว็บ อาจต้องแก้โค้ดส่วนนี้ใหม่
 
 
 def parse_spotify_url(url: str):
@@ -49,38 +28,44 @@ def parse_spotify_url(url: str):
 
 async def fetch_spotify_track_names(session: aiohttp.ClientSession, kind: str, spotify_id: str):
     """
-    ดึงรายชื่อเพลง (ชื่อเพลง + ศิลปิน) จาก Spotify ตามประเภทลิงก์
+    ดึงรายชื่อเพลง (ชื่อเพลง + ศิลปิน) จากหน้า Embed สาธารณะของ Spotify
     คืนค่าเป็น list ของ string เช่น ["Song Name Artist Name", ...]
     """
-    token = await get_spotify_token(session)
-    headers = {"Authorization": f"Bearer {token}"}
+    embed_url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PorkHyunMusicBot/1.0)"}
+
+    async with session.get(embed_url, headers=headers) as r:
+        if r.status != 200:
+            raise RuntimeError(f"เปิดหน้า Spotify embed ไม่ได้ (status {r.status})")
+        html = await r.text()
+
+    # Spotify ฝังข้อมูลเพลงไว้เป็น JSON ใน <script id="__NEXT_DATA__">...</script>
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
+    )
+    if not match:
+        raise RuntimeError("ดึงข้อมูลจากหน้า Spotify ไม่สำเร็จ (โครงสร้างหน้าเว็บอาจเปลี่ยนไป ลองแจ้งแอดมินให้แก้โค้ด)")
+
+    try:
+        data = json.loads(match.group(1))
+        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (KeyError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"อ่านข้อมูลเพลงจาก Spotify ไม่สำเร็จ: {e}")
+
     song_queries = []
 
     if kind == "track":
-        async with session.get(f"https://api.spotify.com/v1/tracks/{spotify_id}", headers=headers) as r:
-            data = await r.json()
-            song_queries.append(f"{data['name']} {data['artists'][0]['name']}")
-
-    elif kind == "album":
-        url = f"https://api.spotify.com/v1/albums/{spotify_id}/tracks?limit=50"
-        while url:
-            async with session.get(url, headers=headers) as r:
-                data = await r.json()
-                for item in data.get("items", []):
-                    song_queries.append(f"{item['name']} {item['artists'][0]['name']}")
-                url = data.get("next")  # Spotify ส่งลิงก์หน้าถัดไปมาให้เอง ถ้ามีเพลงเกิน 50
-
-    elif kind == "playlist":
-        url = f"https://api.spotify.com/v1/playlists/{spotify_id}/tracks?limit=100"
-        while url:
-            async with session.get(url, headers=headers) as r:
-                data = await r.json()
-                for item in data.get("items", []):
-                    track = item.get("track")
-                    if track and track.get("name"):
-                        artist = track["artists"][0]["name"] if track.get("artists") else ""
-                        song_queries.append(f"{track['name']} {artist}")
-                url = data.get("next")  # วนดึงหน้าถัดไปจนกว่า playlist จะหมด
+        name = entity.get("title", "")
+        artist = entity.get("subtitle", "")
+        if name:
+            song_queries.append(f"{name} {artist}")
+    else:
+        # album / playlist -> มีรายการเพลงอยู่ใน trackList
+        for item in entity.get("trackList", []):
+            name = item.get("title", "")
+            artist = item.get("subtitle", "")
+            if name:
+                song_queries.append(f"{name} {artist}")
 
     return song_queries
 
@@ -169,9 +154,6 @@ async def play(ctx: commands.Context, *, search: str):
 
             if not kind:
                 return await ctx.send("❌ ลิงก์ Spotify นี้ไม่รองรับนะ (รองรับแค่ track / album / playlist)")
-
-            if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-                return await ctx.send("❌ ยังไม่ได้ตั้งค่า Spotify API Key ในระบบ (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)")
 
             loading_msg = await ctx.send(f"🔎 กำลังดึงข้อมูลจาก Spotify ({kind})...")
 
