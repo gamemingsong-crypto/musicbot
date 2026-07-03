@@ -5,6 +5,7 @@ import os
 import re
 import json
 import aiohttp
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 # โหลดตัวแปรลับจาก .env 
@@ -24,6 +25,55 @@ def parse_spotify_url(url: str):
             spotify_id = url.split(marker)[1].split("?")[0].split("/")[0]
             return kind, spotify_id
     return None, None
+
+
+def parse_deezer_url(url: str):
+    """แยกประเภท (track/album/playlist) และ ID จากลิงก์ Deezer"""
+    match = re.search(r"deezer\.com/(?:[a-z]{2}/)?(track|album|playlist)/(\d+)", url)
+    if match:
+        return match.group(1), match.group(2)
+    return None, None
+
+
+def deezer_track_to_info(track: dict):
+    artist = track.get("artist") or {}
+    return {
+        "title": track.get("title", ""),
+        "artist": artist.get("name", ""),
+        "duration": track.get("duration"),
+    }
+
+
+async def fetch_deezer_json(session: aiohttp.ClientSession, endpoint: str):
+    api_url = f"https://api.deezer.com/{endpoint}"
+    async with session.get(api_url) as r:
+        if r.status != 200:
+            raise RuntimeError(f"เปิด Deezer API ไม่ได้ (status {r.status})")
+        data = await r.json()
+
+    if isinstance(data, dict) and data.get("error"):
+        message = data["error"].get("message", "unknown error")
+        raise RuntimeError(f"Deezer API error: {message}")
+
+    return data
+
+
+async def fetch_deezer_track_names(session: aiohttp.ClientSession, kind: str, deezer_id: str):
+    if kind == "track":
+        track = await fetch_deezer_json(session, f"track/{deezer_id}")
+        return [deezer_track_to_info(track)] if track.get("title") else []
+
+    data = await fetch_deezer_json(session, f"{kind}/{deezer_id}")
+    tracks = data.get("tracks", {}).get("data", [])
+    return [deezer_track_to_info(track) for track in tracks if track.get("title")]
+
+
+async def search_deezer_track(session: aiohttp.ClientSession, search: str):
+    data = await fetch_deezer_json(session, f"search/track?q={quote(search, safe='')}&limit=1")
+    tracks = data.get("data", [])
+    if not tracks:
+        return None
+    return deezer_track_to_info(tracks[0])
 
 
 async def fetch_spotify_track_names(session: aiohttp.ClientSession, kind: str, spotify_id: str):
@@ -78,7 +128,7 @@ def normalize_track_text(text: str) -> str:
     return text.strip()
 
 
-def spotify_search_queries(track_info: dict):
+def lavalink_search_queries(track_info: dict):
     title = track_info.get("title", "").strip()
     artist = track_info.get("artist", "").strip()
     base = f"{title} {artist}".strip()
@@ -147,6 +197,23 @@ def score_youtube_track(candidate, track_info: dict) -> int:
     if "official" in combined or "audio" in combined:
         score += 8
 
+    wanted_duration = track_info.get("duration")
+    candidate_duration_ms = (
+        getattr(candidate, "length", None)
+        or getattr(candidate, "duration", None)
+    )
+    if wanted_duration and candidate_duration_ms:
+        candidate_duration = int(candidate_duration_ms / 1000)
+        diff = abs(candidate_duration - int(wanted_duration))
+        if diff <= 3:
+            score += 20
+        elif diff <= 8:
+            score += 12
+        elif diff <= 20:
+            score += 4
+        else:
+            score -= 10
+
     return score
 
 
@@ -155,7 +222,7 @@ async def find_best_youtube_match(track_info: dict):
     best_score = -999
     seen = set()
 
-    for query in spotify_search_queries(track_info):
+    for query in lavalink_search_queries(track_info):
         results = await wavelink.Playable.search(query)
         if not results:
             continue
@@ -179,6 +246,23 @@ async def find_best_youtube_match(track_info: dict):
         return None
 
     return best_track
+
+
+async def queue_track_infos(vc: wavelink.Player, track_infos: list[dict]):
+    added_count = 0
+    first_track_title = None
+
+    for track_info in track_infos:
+        track = await find_best_youtube_match(track_info)
+        if not track:
+            continue
+
+        await vc.queue.put_wait(track)
+        added_count += 1
+        if first_track_title is None:
+            first_track_title = track.title
+
+    return added_count, first_track_title
 
 
 # ==================== 1. คลาสปุ่มหน้าปัด (Dashboard) ====================
@@ -259,8 +343,35 @@ async def play(ctx: commands.Context, *, search: str):
         vc = await ctx.author.voice.channel.connect(cls=wavelink.Player)
 
     try:
+        # ---------------- ลิงก์ Deezer (track / album / playlist) ----------------
+        if "deezer.com" in search:
+            kind, deezer_id = parse_deezer_url(search)
+
+            if not kind:
+                return await ctx.send("❌ ลิงก์ Deezer นี้ไม่รองรับนะ (รองรับแค่ track / album / playlist)")
+
+            loading_msg = await ctx.send(f"🔎 กำลังดึงข้อมูลจาก Deezer ({kind})...")
+
+            async with aiohttp.ClientSession() as session:
+                deezer_tracks = await fetch_deezer_track_names(session, kind, deezer_id)
+
+            if not deezer_tracks:
+                await loading_msg.delete()
+                return await ctx.send("❌ ดึงข้อมูลจาก Deezer ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
+
+            added_count, first_track_title = await queue_track_infos(vc, deezer_tracks)
+            await loading_msg.delete()
+
+            if added_count == 0:
+                return await ctx.send("❌ หาเพลงจาก Deezer บน YouTube ไม่เจอเลยสักเพลง")
+
+            if kind == "track":
+                await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Deezer เรียบร้อย: **{first_track_title}**")
+            else:
+                await ctx.send(f"📋 แปลง Deezer {kind} เป็น YouTube สำเร็จ **{added_count}/{len(deezer_tracks)}** เพลง เข้าคิวเรียบร้อย!")
+
         # ---------------- ลิงก์ Spotify (track / album / playlist) ----------------
-        if "spotify.com" in search:
+        elif "spotify.com" in search:
             kind, spotify_id = parse_spotify_url(search)
 
             if not kind:
@@ -275,18 +386,7 @@ async def play(ctx: commands.Context, *, search: str):
                 await loading_msg.delete()
                 return await ctx.send("❌ ดึงข้อมูลจาก Spotify ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
 
-            added_count = 0
-            first_track_title = None
-
-            for track_info in spotify_tracks:
-                track = await find_best_youtube_match(track_info)
-                if not track:
-                    continue  # หาเพลงนี้บน YouTube ไม่เจอหรือผลลัพธ์ไม่ตรงพอ ข้ามไปเพลงถัดไป
-                await vc.queue.put_wait(track)
-                added_count += 1
-                if first_track_title is None:
-                    first_track_title = track.title
-
+            added_count, first_track_title = await queue_track_infos(vc, spotify_tracks)
             await loading_msg.delete()
 
             if added_count == 0:
@@ -297,23 +397,43 @@ async def play(ctx: commands.Context, *, search: str):
             else:
                 await ctx.send(f"📋 แปลง Spotify {kind} เป็น YouTube สำเร็จ **{added_count}/{len(spotify_tracks)}** เพลง เข้าคิวเรียบร้อย!")
 
-        # ---------------- ไม่ใช่ Spotify ก็ค้นหา/เล่นตามปกติ (YouTube ลิงก์ หรือค้นชื่อเพลง) ----------------
+        # ---------------- คำค้นทั่วไป: ใช้ Deezer เป็นหลัก แล้วค่อย fallback ไปค้นหาตรง ----------------
         else:
-            tracks = await wavelink.Playable.search(search)
+            deezer_track = None
+            fallback_tracks = None
+            if not re.match(r"https?://", search, flags=re.IGNORECASE):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        deezer_track = await search_deezer_track(session, search)
+                except Exception as e:
+                    print(f"Deezer search fallback: {e}")
 
-            if not tracks:
-                return await ctx.send("❌ หาเพลงไม่เจอ! เช็คลิ้งก์หรือชื่อเพลงใหม่ซะ")
-
-            if isinstance(tracks, wavelink.Playlist):
-                for track in tracks.tracks:
+            if deezer_track:
+                track = await find_best_youtube_match(deezer_track)
+                if track:
                     await vc.queue.put_wait(track)
-                await ctx.send(f"📋 เหมา Playlist: **{tracks.name}** ({len(tracks.tracks)} เพลง) เข้าคิวเรียบร้อย!")
+                    if vc.playing:
+                        msg = await ctx.send(f"📋 เพิ่มเข้าคิวจาก Deezer เรียบร้อย: **{track.title}** (คิวที่ #{vc.queue.count})")
+                        await msg.delete(delay=10)
+                else:
+                    fallback_tracks = await wavelink.Playable.search(search)
             else:
-                track = tracks[0]
-                await vc.queue.put_wait(track)
-                if vc.playing:
-                    msg = await ctx.send(f"📋 เพิ่มเข้าคิวเรียบร้อย: **{track.title}** (คิวที่ #{vc.queue.count})")
-                    await msg.delete(delay=10)
+                fallback_tracks = await wavelink.Playable.search(search)
+
+            if fallback_tracks is not None:
+                if not fallback_tracks:
+                    return await ctx.send("❌ หาเพลงไม่เจอ! เช็คลิ้งก์หรือชื่อเพลงใหม่ซะ")
+
+                if isinstance(fallback_tracks, wavelink.Playlist):
+                    for track in fallback_tracks.tracks:
+                        await vc.queue.put_wait(track)
+                    await ctx.send(f"📋 เหมา Playlist: **{fallback_tracks.name}** ({len(fallback_tracks.tracks)} เพลง) เข้าคิวเรียบร้อย!")
+                else:
+                    track = fallback_tracks[0]
+                    await vc.queue.put_wait(track)
+                    if vc.playing:
+                        msg = await ctx.send(f"📋 เพิ่มเข้าคิวเรียบร้อย: **{track.title}** (คิวที่ #{vc.queue.count})")
+                        await msg.delete(delay=10)
 
         if not vc.playing:
             next_track = vc.queue.get()
