@@ -2,10 +2,88 @@ import discord
 from discord.ext import commands
 import wavelink
 import os
+import time
+import base64
+import aiohttp
 from dotenv import load_dotenv
 
 # โหลดตัวแปรลับจาก .env 
 load_dotenv()
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+# ==================== 0. ระบบเชื่อมต่อ Spotify API ====================
+# แคช token ไว้ใช้ซ้ำ (ไม่ต้องขอใหม่ทุกครั้งที่มีคนสั่งเพลง)
+_spotify_token_cache = {"token": None, "expires_at": 0}
+
+
+async def get_spotify_token(session: aiohttp.ClientSession) -> str:
+    """ขอ (หรือใช้ token เดิมที่แคชไว้) Access Token จาก Spotify"""
+    if _spotify_token_cache["token"] and time.time() < _spotify_token_cache["expires_at"]:
+        return _spotify_token_cache["token"]
+
+    creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    async with session.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Authorization": f"Basic {creds}"},
+        data={"grant_type": "client_credentials"},
+    ) as r:
+        data = await r.json()
+        token = data["access_token"]
+        # เผื่อเวลาหมดอายุไว้ล่วงหน้า 60 วินาที กันเคส token หมดอายุพอดีตอนใช้งาน
+        _spotify_token_cache["token"] = token
+        _spotify_token_cache["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+        return token
+
+
+def parse_spotify_url(url: str):
+    """แยกประเภท (track/album/playlist) และ ID จากลิงก์ Spotify"""
+    for kind in ("track", "album", "playlist"):
+        marker = f"/{kind}/"
+        if marker in url:
+            spotify_id = url.split(marker)[1].split("?")[0].split("/")[0]
+            return kind, spotify_id
+    return None, None
+
+
+async def fetch_spotify_track_names(session: aiohttp.ClientSession, kind: str, spotify_id: str):
+    """
+    ดึงรายชื่อเพลง (ชื่อเพลง + ศิลปิน) จาก Spotify ตามประเภทลิงก์
+    คืนค่าเป็น list ของ string เช่น ["Song Name Artist Name", ...]
+    """
+    token = await get_spotify_token(session)
+    headers = {"Authorization": f"Bearer {token}"}
+    song_queries = []
+
+    if kind == "track":
+        async with session.get(f"https://api.spotify.com/v1/tracks/{spotify_id}", headers=headers) as r:
+            data = await r.json()
+            song_queries.append(f"{data['name']} {data['artists'][0]['name']}")
+
+    elif kind == "album":
+        url = f"https://api.spotify.com/v1/albums/{spotify_id}/tracks?limit=50"
+        while url:
+            async with session.get(url, headers=headers) as r:
+                data = await r.json()
+                for item in data.get("items", []):
+                    song_queries.append(f"{item['name']} {item['artists'][0]['name']}")
+                url = data.get("next")  # Spotify ส่งลิงก์หน้าถัดไปมาให้เอง ถ้ามีเพลงเกิน 50
+
+    elif kind == "playlist":
+        url = f"https://api.spotify.com/v1/playlists/{spotify_id}/tracks?limit=100"
+        while url:
+            async with session.get(url, headers=headers) as r:
+                data = await r.json()
+                for item in data.get("items", []):
+                    track = item.get("track")
+                    if track and track.get("name"):
+                        artist = track["artists"][0]["name"] if track.get("artists") else ""
+                        song_queries.append(f"{track['name']} {artist}")
+                url = data.get("next")  # วนดึงหน้าถัดไปจนกว่า playlist จะหมด
+
+    return song_queries
+
 
 # ==================== 1. คลาสปุ่มหน้าปัด (Dashboard) ====================
 class MusicDashboard(discord.ui.View):
@@ -16,7 +94,8 @@ class MusicDashboard(discord.ui.View):
     @discord.ui.button(label="ฟังเพลงใหม่", style=discord.ButtonStyle.success, emoji="▶️", custom_id="play_btn")
     async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         help_text = """**🎵 คู่มือคำสั่งบอทเพลง Pork Hyun Radio:**
-`!p` หรือ `!play <ชื่อเพลง หรือ ลิงก์>` : ใช้เรียกบอทเข้าห้องเสียงเพื่อเปิดเพลงตามที่ต้องการ
+`!p` หรือ `!play <ชื่อเพลง / ลิงก์ YouTube / ลิงก์ Spotify>` : เรียกบอทเข้าห้องเสียงเพื่อเปิดเพลง
+รองรับลิงก์ Spotify ทั้งเพลงเดี่ยว, อัลบั้ม และเพลย์ลิสต์ (ระบบจะแปลงเป็นค้นหาบน YouTube ให้อัตโนมัติ)
 `!q` : เช็คคิวเพลง
 `!skip` : สั่งข้ามเพลงที่กำลังเล่นอยู่ไปฟังเพลงถัดไป
 `!pause` : สั่งหยุดเพลงชั่วคราว (พักเบรก)
@@ -75,7 +154,7 @@ async def spawn_dashboard(ctx: commands.Context):
 
 @bot.command(name='play', aliases=['p'])
 async def play(ctx: commands.Context, *, search: str):
-    """🎵 สั่งเปิดเพลง (รองรับ Spotify, YouTube & ค้นหาชื่อเพลง)"""
+    """🎵 สั่งเปิดเพลง (รองรับ Spotify (track/album/playlist), YouTube & ค้นหาชื่อเพลง)"""
     if not ctx.author.voice:
         return await ctx.send("❌ ไก่อ่อนเอ๊ย! นายต้องเข้าไปในห้องเสียงก่อนสิ!")
 
@@ -84,48 +163,65 @@ async def play(ctx: commands.Context, *, search: str):
         vc = await ctx.author.voice.channel.connect(cls=wavelink.Player)
 
     try:
-        # เช็คว่าเป็นลิงก์ Spotify ไหม
-        if "spotify.com/track" in search:
-            import aiohttp, base64
-            client_id = "f86099903feb4ed2be967b19c113c5e5"
-            client_secret = "e82844642b4d40d3b405362c2a10f8d0"
-            track_id = search.split("/track/")[1].split("?")[0]
-            
-            creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        # ---------------- ลิงก์ Spotify (track / album / playlist) ----------------
+        if "spotify.com" in search:
+            kind, spotify_id = parse_spotify_url(search)
+
+            if not kind:
+                return await ctx.send("❌ ลิงก์ Spotify นี้ไม่รองรับนะ (รองรับแค่ track / album / playlist)")
+
+            if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+                return await ctx.send("❌ ยังไม่ได้ตั้งค่า Spotify API Key ในระบบ (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET)")
+
+            loading_msg = await ctx.send(f"🔎 กำลังดึงข้อมูลจาก Spotify ({kind})...")
+
             async with aiohttp.ClientSession() as session:
-                # ขอ token จากระบบ Spotify ที่ถูกต้อง
-                async with session.post("https://accounts.spotify.com/api/token",
-                    headers={"Authorization": f"Basic {creds}"},
-                    data={"grant_type": "client_credentials"}) as r:
-                    token_data = await r.json()
-                    token = token_data["access_token"]
-                
-                # ดึงชื่อเพลง
-                async with session.get(f"https://api.spotify.com/v1/tracks/{track_id}",
-                    headers={"Authorization": f"Bearer {token}"}) as r:
-                    data = await r.json()
-                    song_name = f"{data['name']} {data['artists'][0]['name']}"
-            
-            # แปลงร่างไปค้นหาด้วยชื่อเพลงแทน
-            tracks = await wavelink.Playable.search(f"ytsearch:{song_name}")
-        
-        # ถ้าไม่ใช่ Spotify ก็ค้นหาตามปกติ
+                song_queries = await fetch_spotify_track_names(session, kind, spotify_id)
+
+            if not song_queries:
+                await loading_msg.delete()
+                return await ctx.send("❌ ดึงข้อมูลจาก Spotify ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
+
+            added_count = 0
+            first_track_title = None
+
+            for query in song_queries:
+                results = await wavelink.Playable.search(f"ytsearch:{query}")
+                if not results:
+                    continue  # หาเพลงนี้บน YouTube ไม่เจอ ข้ามไปเพลงถัดไป
+                track = results[0]
+                await vc.queue.put_wait(track)
+                added_count += 1
+                if first_track_title is None:
+                    first_track_title = track.title
+
+            await loading_msg.delete()
+
+            if added_count == 0:
+                return await ctx.send("❌ หาเพลงจาก Spotify บน YouTube ไม่เจอเลยสักเพลง")
+
+            if kind == "track":
+                await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Spotify เรียบร้อย: **{first_track_title}**")
+            else:
+                await ctx.send(f"📋 แปลง Spotify {kind} เป็น YouTube สำเร็จ **{added_count}/{len(song_queries)}** เพลง เข้าคิวเรียบร้อย!")
+
+        # ---------------- ไม่ใช่ Spotify ก็ค้นหา/เล่นตามปกติ (YouTube ลิงก์ หรือค้นชื่อเพลง) ----------------
         else:
             tracks = await wavelink.Playable.search(search)
-                
-        if not tracks:
-            return await ctx.send("❌ หาเพลงไม่เจอ! เช็คลิ้งก์หรือชื่อเพลงใหม่ซะ")
 
-        if isinstance(tracks, wavelink.Playlist):
-            for track in tracks.tracks:
+            if not tracks:
+                return await ctx.send("❌ หาเพลงไม่เจอ! เช็คลิ้งก์หรือชื่อเพลงใหม่ซะ")
+
+            if isinstance(tracks, wavelink.Playlist):
+                for track in tracks.tracks:
+                    await vc.queue.put_wait(track)
+                await ctx.send(f"📋 เหมา Playlist: **{tracks.name}** ({len(tracks.tracks)} เพลง) เข้าคิวเรียบร้อย!")
+            else:
+                track = tracks[0]
                 await vc.queue.put_wait(track)
-            await ctx.send(f"📋 เหมา Playlist: **{tracks.name}** ({len(tracks.tracks)} เพลง) เข้าคิวเรียบร้อย!")
-        else:
-            track = tracks[0]
-            await vc.queue.put_wait(track)
-            if vc.playing:
-                msg = await ctx.send(f"📋 เพิ่มเข้าคิวเรียบร้อย: **{track.title}** (คิวที่ #{vc.queue.count})")
-                await msg.delete(delay=10)
+                if vc.playing:
+                    msg = await ctx.send(f"📋 เพิ่มเข้าคิวเรียบร้อย: **{track.title}** (คิวที่ #{vc.queue.count})")
+                    await msg.delete(delay=10)
 
         if not vc.playing:
             next_track = vc.queue.get()
