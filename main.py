@@ -52,22 +52,133 @@ async def fetch_spotify_track_names(session: aiohttp.ClientSession, kind: str, s
     except (KeyError, json.JSONDecodeError) as e:
         raise RuntimeError(f"อ่านข้อมูลเพลงจาก Spotify ไม่สำเร็จ: {e}")
 
-    song_queries = []
+    spotify_tracks = []
 
     if kind == "track":
         name = entity.get("title", "")
         artist = entity.get("subtitle", "")
         if name:
-            song_queries.append(f"{name} {artist}")
+            spotify_tracks.append({"title": name, "artist": artist})
     else:
         # album / playlist -> มีรายการเพลงอยู่ใน trackList
         for item in entity.get("trackList", []):
             name = item.get("title", "")
             artist = item.get("subtitle", "")
             if name:
-                song_queries.append(f"{name} {artist}")
+                spotify_tracks.append({"title": name, "artist": artist})
 
-    return song_queries
+    return spotify_tracks
+
+
+def normalize_track_text(text: str) -> str:
+    """ทำให้ข้อความเทียบกันง่ายขึ้นตอนจับคู่ Spotify -> YouTube"""
+    text = text.lower()
+    text = re.sub(r"[\(\)\[\]\{\}\-_/|:;,.!?\"']", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def spotify_search_queries(track_info: dict):
+    title = track_info.get("title", "").strip()
+    artist = track_info.get("artist", "").strip()
+    base = f"{title} {artist}".strip()
+
+    queries = [
+        f'ytsearch:"{title}" "{artist}" official audio',
+        f"ytsearch:{base} official audio",
+        f"ytsearch:{base}",
+    ]
+
+    # กันกรณี subtitle จาก Spotify มีคำเสริมแปลก ๆ หรือหลายศิลปินมากเกินไป
+    first_artist = re.split(r",|&| feat\. | ft\. ", artist, flags=re.IGNORECASE)[0].strip()
+    if first_artist and first_artist != artist:
+        queries.append(f"ytsearch:{title} {first_artist} official audio")
+
+    return queries
+
+
+def score_youtube_track(candidate, track_info: dict) -> int:
+    spotify_title = track_info.get("title", "")
+    spotify_artist = track_info.get("artist", "")
+    wanted_title = normalize_track_text(spotify_title)
+    wanted_artist = normalize_track_text(spotify_artist)
+    candidate_title = normalize_track_text(getattr(candidate, "title", ""))
+    candidate_author = normalize_track_text(getattr(candidate, "author", ""))
+    combined = f"{candidate_title} {candidate_author}"
+
+    score = 0
+    if wanted_title and wanted_title in candidate_title:
+        score += 45
+
+    title_words = [word for word in wanted_title.split() if len(word) > 1]
+    if title_words:
+        matched_words = sum(1 for word in title_words if word in candidate_title)
+        score += int((matched_words / len(title_words)) * 25)
+
+    artist_parts = [
+        part.strip()
+        for part in re.split(r",|&| feat\. | ft\. ", wanted_artist, flags=re.IGNORECASE)
+        if part.strip()
+    ]
+    if artist_parts:
+        if any(part in combined for part in artist_parts):
+            score += 35
+        else:
+            score -= 35
+
+    unwanted_versions = (
+        "remix",
+        "mix",
+        "cover",
+        "karaoke",
+        "instrumental",
+        "live",
+        "sped up",
+        "slowed",
+        "nightcore",
+        "dstrd",
+        "sgnl",
+    )
+    spotify_all = normalize_track_text(f"{spotify_title} {spotify_artist}")
+    for word in unwanted_versions:
+        if word in combined and word not in spotify_all:
+            score -= 18
+
+    if "official" in combined or "audio" in combined:
+        score += 8
+
+    return score
+
+
+async def find_best_youtube_match(track_info: dict):
+    best_track = None
+    best_score = -999
+    seen = set()
+
+    for query in spotify_search_queries(track_info):
+        results = await wavelink.Playable.search(query)
+        if not results:
+            continue
+
+        for candidate in results[:8]:
+            key = (
+                getattr(candidate, "uri", None)
+                or f"{getattr(candidate, 'title', '')}:{getattr(candidate, 'author', '')}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            score = score_youtube_track(candidate, track_info)
+            if score > best_score:
+                best_track = candidate
+                best_score = score
+
+    # ถ้าคะแนนต่ำมาก แปลว่าศิลปินไม่ตรงหรือเป็นคนละเวอร์ชัน ให้ข้ามดีกว่าใส่เพลงผิดคิว
+    if best_score < 35:
+        return None
+
+    return best_track
 
 
 # ==================== 1. คลาสปุ่มหน้าปัด (Dashboard) ====================
@@ -158,20 +269,19 @@ async def play(ctx: commands.Context, *, search: str):
             loading_msg = await ctx.send(f"🔎 กำลังดึงข้อมูลจาก Spotify ({kind})...")
 
             async with aiohttp.ClientSession() as session:
-                song_queries = await fetch_spotify_track_names(session, kind, spotify_id)
+                spotify_tracks = await fetch_spotify_track_names(session, kind, spotify_id)
 
-            if not song_queries:
+            if not spotify_tracks:
                 await loading_msg.delete()
                 return await ctx.send("❌ ดึงข้อมูลจาก Spotify ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
 
             added_count = 0
             first_track_title = None
 
-            for query in song_queries:
-                results = await wavelink.Playable.search(f"ytsearch:{query}")
-                if not results:
-                    continue  # หาเพลงนี้บน YouTube ไม่เจอ ข้ามไปเพลงถัดไป
-                track = results[0]
+            for track_info in spotify_tracks:
+                track = await find_best_youtube_match(track_info)
+                if not track:
+                    continue  # หาเพลงนี้บน YouTube ไม่เจอหรือผลลัพธ์ไม่ตรงพอ ข้ามไปเพลงถัดไป
                 await vc.queue.put_wait(track)
                 added_count += 1
                 if first_track_title is None:
@@ -185,7 +295,7 @@ async def play(ctx: commands.Context, *, search: str):
             if kind == "track":
                 await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Spotify เรียบร้อย: **{first_track_title}**")
             else:
-                await ctx.send(f"📋 แปลง Spotify {kind} เป็น YouTube สำเร็จ **{added_count}/{len(song_queries)}** เพลง เข้าคิวเรียบร้อย!")
+                await ctx.send(f"📋 แปลง Spotify {kind} เป็น YouTube สำเร็จ **{added_count}/{len(spotify_tracks)}** เพลง เข้าคิวเรียบร้อย!")
 
         # ---------------- ไม่ใช่ Spotify ก็ค้นหา/เล่นตามปกติ (YouTube ลิงก์ หรือค้นชื่อเพลง) ----------------
         else:
