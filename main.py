@@ -47,7 +47,12 @@ MUSIC_REQUEST_CHANNEL_NAMES = parse_channel_names(
     os.getenv("MUSIC_REQUEST_CHANNEL_NAMES"),
     ("ห้องขอเพลง",),
 )
-MUSIC_VOICE_CHANNEL_IDS = parse_channel_ids(os.getenv("MUSIC_VOICE_CHANNEL_IDS"))
+MUSIC_VOICE_CHANNEL_IDS = parse_channel_ids(os.getenv("MUSIC_VOICE_CHANNEL_IDS")) or (
+    1522556101256806491,  # Music Room 1
+    1508703259592753242,  # Music Room 2
+    1508703233370226843,  # Music Room 3
+    1519909824538738759,  # Music Room 4
+)
 MUSIC_VOICE_CHANNEL_NAMES = parse_channel_names(
     os.getenv("MUSIC_VOICE_CHANNEL_NAMES"),
     tuple(f"Music Room {index}" for index in range(1, 5)),
