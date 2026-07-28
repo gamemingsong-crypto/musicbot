@@ -58,6 +58,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         main.bot.player_resume_positions.clear()
         main.bot.player_transient_retries.clear()
         main.bot.voice_connect_locks.clear()
+        main.bot.node_reconnect_locks.clear()
 
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")
@@ -158,6 +159,48 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(main.is_voice_connect_timeout(channel_timeout()))
         self.assertTrue(main.is_voice_connect_timeout(TimeoutError()))
         self.assertFalse(main.is_voice_connect_timeout(RuntimeError()))
+
+    async def test_dead_wavelink_websocket_is_reconnected(self):
+        class FakeTask:
+            def __init__(self, done):
+                self._done = done
+
+            def done(self):
+                return self._done
+
+            def cancelled(self):
+                return False
+
+            def exception(self):
+                return TypeError("bad websocket frame")
+
+        class FakeWebsocket:
+            def __init__(self):
+                self.keep_alive_task = FakeTask(True)
+                self.connect_calls = 0
+
+            async def connect(self):
+                self.connect_calls += 1
+                self.keep_alive_task = FakeTask(False)
+
+        class FakeNode:
+            identifier = "test-node"
+
+            def __init__(self):
+                self._websocket = FakeWebsocket()
+
+        node = FakeNode()
+        nodes = main.wavelink.Pool._Pool__nodes
+        original_nodes = nodes.copy()
+        nodes.clear()
+        nodes[node.identifier] = node
+        try:
+            await main.check_wavelink_websocket_health()
+        finally:
+            nodes.clear()
+            nodes.update(original_nodes)
+
+        self.assertEqual(node._websocket.connect_calls, 1)
 
     def test_failed_track_end_is_ignored_once(self):
         player = object.__new__(FakePlayer)

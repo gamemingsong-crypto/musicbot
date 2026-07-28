@@ -1506,6 +1506,36 @@ async def check_player_health():
             bot.player_resume_positions.pop(guild_id, None)
 
 
+async def check_wavelink_websocket_health():
+    if bot.is_closed():
+        return
+
+    for node in list(wavelink.Pool.nodes.values()):
+        websocket = getattr(node, "_websocket", None)
+        keep_alive_task = getattr(websocket, "keep_alive_task", None) if websocket else None
+        if not websocket or not keep_alive_task or not keep_alive_task.done():
+            continue
+
+        if keep_alive_task.cancelled():
+            error = "task cancelled"
+        else:
+            try:
+                error = keep_alive_task.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError) as task_error:
+                error = task_error
+
+        lock = bot.node_reconnect_locks.setdefault(node.identifier, asyncio.Lock())
+        if lock.locked():
+            continue
+
+        async with lock:
+            current_task = getattr(websocket, "keep_alive_task", None)
+            if current_task and not current_task.done():
+                continue
+            print(f"[lavalink] websocket task stopped ({error}); reconnecting node")
+            await websocket.connect()
+
+
 def save_dashboard_state(channel_id: int, message_id: int):
     try:
         with open(DASHBOARD_STATE_PATH, "w", encoding="utf-8") as f:
@@ -1795,6 +1825,7 @@ class OreoCloneBot(commands.Bot):
         self.player_resume_positions = {}
         self.player_transient_retries = {}
         self.voice_connect_locks = {}
+        self.node_reconnect_locks = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
@@ -1860,6 +1891,13 @@ class OreoCloneBot(commands.Bot):
             if guild and guild.id not in self.player_last_update:
                 self.player_unhealthy_since.setdefault(guild.id, time.monotonic())
 
+    async def close(self):
+        try:
+            await wavelink.Pool.close()
+        except Exception as error:
+            print(f"[shutdown] closing Lavalink sessions failed: {error}")
+        await super().close()
+
 bot = OreoCloneBot()
 
 
@@ -1904,6 +1942,7 @@ async def empty_voice_cleanup_task():
 @tasks.loop(seconds=PLAYER_HEALTH_CHECK_SECONDS)
 async def player_health_watchdog_task():
     try:
+        await check_wavelink_websocket_health()
         await check_player_health()
     except Exception as error:
         print(f"[watchdog] Player health watchdog ทำงานผิดพลาด: {error}")
