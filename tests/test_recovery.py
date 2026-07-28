@@ -57,6 +57,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         main.bot.player_recovery_locks.clear()
         main.bot.player_resume_positions.clear()
         main.bot.player_transient_retries.clear()
+        main.bot.voice_connect_locks.clear()
 
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")
@@ -150,6 +151,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(main.register_transient_track_retry(player, track), 1)
         self.assertEqual(main.register_transient_track_retry(player, track), 0)
+
+    def test_voice_connect_timeout_detection(self):
+        channel_timeout = type("ChannelTimeoutException", (Exception,), {})
+
+        self.assertTrue(main.is_voice_connect_timeout(channel_timeout()))
+        self.assertTrue(main.is_voice_connect_timeout(TimeoutError()))
+        self.assertFalse(main.is_voice_connect_timeout(RuntimeError()))
 
     def test_failed_track_end_is_ignored_once(self):
         player = object.__new__(FakePlayer)

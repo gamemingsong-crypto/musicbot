@@ -1077,6 +1077,12 @@ PLAYER_TRANSIENT_RETRY_DELAY_SECONDS = max(
     int(os.getenv("PLAYER_TRANSIENT_RETRY_DELAY_SECONDS", "5")),
 )
 PLAYER_TRANSIENT_RETRY_WINDOW_SECONDS = 120
+VOICE_CONNECT_ATTEMPTS = max(1, int(os.getenv("VOICE_CONNECT_ATTEMPTS", "3")))
+VOICE_CONNECT_TIMEOUT_SECONDS = max(10, float(os.getenv("VOICE_CONNECT_TIMEOUT_SECONDS", "20")))
+VOICE_CONNECT_RETRY_DELAY_SECONDS = max(
+    1,
+    float(os.getenv("VOICE_CONNECT_RETRY_DELAY_SECONDS", "2")),
+)
 
 
 def queue_snapshot_from_player(player) -> list[dict]:
@@ -1257,6 +1263,73 @@ async def disconnect_empty_voice_player(player, channel, empty_seconds: float):
         f"🚪 ห้อง {getattr(channel, 'name', 'Unknown')} ไม่มีผู้ฟัง "
         f"{int(empty_seconds)} วิ ล้างคิวและออกจากห้องแล้ว"
     )
+
+
+def is_voice_connect_timeout(error: Exception) -> bool:
+    return isinstance(error, asyncio.TimeoutError) or error.__class__.__name__ == "ChannelTimeoutException"
+
+
+async def cleanup_stale_voice_connection(guild: discord.Guild):
+    player = discord.utils.get(bot.voice_clients, guild=guild)
+    if player:
+        try:
+            await asyncio.wait_for(player.disconnect(), timeout=5)
+        except Exception as error:
+            print(f"[voice-connect] stale player disconnect failed: {error}")
+            cleanup = getattr(player, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+
+    bot_member = getattr(guild, "me", None)
+    if bot_member and getattr(getattr(bot_member, "voice", None), "channel", None):
+        try:
+            await guild.change_voice_state(channel=None)
+        except discord.DiscordException as error:
+            print(f"[voice-connect] stale Discord voice state cleanup failed: {error}")
+
+
+async def connect_music_player(voice_channel: discord.VoiceChannel) -> wavelink.Player:
+    guild = voice_channel.guild
+    lock = bot.voice_connect_locks.setdefault(guild.id, asyncio.Lock())
+
+    async with lock:
+        existing = discord.utils.get(bot.voice_clients, guild=guild)
+        if (
+            existing
+            and getattr(existing, "connected", False)
+            and getattr(getattr(existing, "channel", None), "id", None) == voice_channel.id
+        ):
+            return existing
+
+        last_error = None
+        for attempt in range(1, VOICE_CONNECT_ATTEMPTS + 1):
+            if existing:
+                await cleanup_stale_voice_connection(guild)
+                existing = None
+
+            try:
+                player = await voice_channel.connect(
+                    cls=wavelink.Player,
+                    timeout=VOICE_CONNECT_TIMEOUT_SECONDS,
+                )
+                print(
+                    f"[voice-connect] connected to {voice_channel.name} "
+                    f"on attempt {attempt}/{VOICE_CONNECT_ATTEMPTS}"
+                )
+                return player
+            except Exception as error:
+                if not is_voice_connect_timeout(error):
+                    raise
+                last_error = error
+                print(
+                    f"[voice-connect] timeout connecting to {voice_channel.name} "
+                    f"attempt {attempt}/{VOICE_CONNECT_ATTEMPTS}: {error}"
+                )
+                await cleanup_stale_voice_connection(guild)
+                if attempt < VOICE_CONNECT_ATTEMPTS:
+                    await asyncio.sleep(VOICE_CONNECT_RETRY_DELAY_SECONDS)
+
+        raise last_error or asyncio.TimeoutError("Discord voice connection timed out")
 
 
 async def force_disconnect_player(player, reason: str):
@@ -1690,6 +1763,7 @@ class OreoCloneBot(commands.Bot):
         self.player_recovery_locks = {}
         self.player_resume_positions = {}
         self.player_transient_retries = {}
+        self.voice_connect_locks = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
@@ -1987,7 +2061,7 @@ async def play(ctx: commands.Context, *, search: str):
     vc: wavelink.Player = ctx.voice_client
     try:
         if not vc:
-            vc = await voice_channel.connect(cls=wavelink.Player, timeout=60.0)
+            vc = await connect_music_player(voice_channel)
 
         # ---------------- ลิงก์ Deezer (track / album / playlist) ----------------
         if "deezer.com" in search:
@@ -2105,8 +2179,11 @@ async def play(ctx: commands.Context, *, search: str):
         refresh_current_playback_status()
 
     except Exception as e:
-        if e.__class__.__name__ == "ChannelTimeoutException":
-            await ctx.send("❌ ต่อเข้าห้องเสียงไม่ทันใน 60 วิ ลองสั่งเพลงใหม่อีกครั้ง")
+        if is_voice_connect_timeout(e):
+            await ctx.send(
+                "❌ เชื่อมต่อห้องเสียงไม่สำเร็จหลังลอง 3 ครั้ง "
+                "กรุณารอสักครู่แล้วสั่งเพลงใหม่อีกครั้ง"
+            )
             print(f"Voice connect timeout: {e}")
             return
 
