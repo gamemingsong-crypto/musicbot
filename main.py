@@ -635,6 +635,110 @@ def recovery_start_position(player, track) -> int:
     return start_ms
 
 
+def track_exception_text(exception) -> str:
+    if isinstance(exception, dict):
+        return " ".join(
+            str(exception.get(key, ""))
+            for key in ("message", "cause", "severity")
+        ).casefold()
+
+    return " ".join(
+        str(value)
+        for value in (
+            exception,
+            getattr(exception, "message", ""),
+            getattr(exception, "cause", ""),
+        )
+    ).casefold()
+
+
+def is_transient_track_error(exception) -> bool:
+    error_text = track_exception_text(exception)
+    return any(
+        marker in error_text
+        for marker in (
+            "temporary failure in name resolution",
+            "unknownhostexception",
+            "connection reset",
+            "connection timed out",
+            "connect timed out",
+            "read timed out",
+            "no route to host",
+            "network is unreachable",
+        )
+    )
+
+
+def register_transient_track_retry(player, track) -> int | None:
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    track_key = track_identity(track)
+    if not guild_id or not track_key:
+        return None
+
+    now = time.monotonic()
+    state = bot.player_transient_retries.get(guild_id)
+    if (
+        not state
+        or state.get("track_key") != track_key
+        or now - state.get("updated_at", 0) > PLAYER_TRANSIENT_RETRY_WINDOW_SECONDS
+    ):
+        checkpoint = bot.player_resume_positions.get(guild_id, {})
+        state = {
+            "track_key": track_key,
+            "attempts": 0,
+            "baseline_position_ms": int(checkpoint.get("position_ms", 0)),
+        }
+
+    if state.get("pending"):
+        return 0
+
+    state["attempts"] += 1
+    state["updated_at"] = now
+    state["pending"] = True
+    bot.player_transient_retries[guild_id] = state
+    if state["attempts"] > PLAYER_TRANSIENT_RETRY_MAX:
+        return None
+    return state["attempts"]
+
+
+def release_transient_retry(player, track):
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    state = bot.player_transient_retries.get(guild_id) if guild_id else None
+    if not state or state.get("track_key") != track_identity(track):
+        return
+    state["pending"] = False
+    state["updated_at"] = time.monotonic()
+
+
+def clear_transient_track_retry(player, track=None):
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if not guild_id:
+        return
+
+    state = bot.player_transient_retries.get(guild_id)
+    if not state or (track and state.get("track_key") != track_identity(track)):
+        return
+    bot.player_transient_retries.pop(guild_id, None)
+
+
+def clear_transient_retry_after_progress(player, position_ms: int):
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    state = bot.player_transient_retries.get(guild_id) if guild_id else None
+    if not state or state.get("track_key") != track_identity(getattr(player, "current", None)):
+        return
+
+    try:
+        position_ms = int(position_ms)
+    except (TypeError, ValueError):
+        return
+    if position_ms >= state.get("baseline_position_ms", 0) + 5000:
+        bot.player_transient_retries.pop(guild_id, None)
+
+
 class TrackSelect(discord.ui.Select):
     def __init__(self, parent: "TrackSearchView"):
         self.parent_view = parent
@@ -967,6 +1071,12 @@ PLAYER_HEALTH_CHECK_SECONDS = 15
 PLAYER_STALE_SECONDS = 45
 PLAYER_RECOVERY_MAX_ATTEMPTS = 3
 PLAYER_RESUME_REWIND_MS = max(0, int(os.getenv("PLAYER_RESUME_REWIND_MS", "3000")))
+PLAYER_TRANSIENT_RETRY_MAX = max(1, int(os.getenv("PLAYER_TRANSIENT_RETRY_MAX", "3")))
+PLAYER_TRANSIENT_RETRY_DELAY_SECONDS = max(
+    1,
+    int(os.getenv("PLAYER_TRANSIENT_RETRY_DELAY_SECONDS", "5")),
+)
+PLAYER_TRANSIENT_RETRY_WINDOW_SECONDS = 120
 
 
 def queue_snapshot_from_player(player) -> list[dict]:
@@ -1157,6 +1267,7 @@ async def force_disconnect_player(player, reason: str):
         bot.player_last_update.pop(guild_id, None)
         bot.player_unhealthy_since.pop(guild_id, None)
         bot.player_resume_positions.pop(guild_id, None)
+        bot.player_transient_retries.pop(guild_id, None)
 
     try:
         await player.disconnect()
@@ -1578,6 +1689,7 @@ class OreoCloneBot(commands.Bot):
         self.player_unhealthy_since = {}
         self.player_recovery_locks = {}
         self.player_resume_positions = {}
+        self.player_transient_retries = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
@@ -1799,6 +1911,7 @@ async def on_wavelink_player_update(payload: wavelink.PlayerUpdateEventPayload):
         return
     bot.player_last_update[guild.id] = time.monotonic()
     bot.player_unhealthy_since.pop(guild.id, None)
+    clear_transient_retry_after_progress(player, getattr(payload, "position", 0))
     remember_player_position(player, getattr(payload, "position", 0))
 
 
@@ -2100,6 +2213,9 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if not player:
         return
     guild = getattr(player, "guild", None)
+    retry_state = bot.player_transient_retries.get(getattr(guild, "id", None))
+    if retry_state and retry_state.get("track_key") != track_identity(getattr(payload, "track", None)):
+        clear_transient_track_retry(player)
     if guild:
         bot.player_last_update[guild.id] = time.monotonic()
         bot.player_unhealthy_since.pop(guild.id, None)
@@ -2145,6 +2261,27 @@ async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPaylo
         f"severity={getattr(exception, 'severity', 'unknown')} "
         f"message={getattr(exception, 'message', exception)}"
     )
+    if is_transient_track_error(exception):
+        attempt = register_transient_track_retry(player, track)
+        if attempt == 0:
+            print("[recovery] transient retry already pending")
+            return
+        if attempt:
+            delay = PLAYER_TRANSIENT_RETRY_DELAY_SECONDS
+            print(
+                f"[recovery] transient source/network error; retrying current track "
+                f"{attempt}/{PLAYER_TRANSIENT_RETRY_MAX} in {delay}s"
+            )
+            await asyncio.sleep(delay)
+            release_transient_retry(player, track)
+            await recover_player(
+                player,
+                reason=f"transient source/network error retry {attempt}",
+                replay_current=True,
+            )
+            return
+        clear_transient_track_retry(player)
+        print("[recovery] transient retry limit reached; advancing the queue")
     try:
         await player.channel.send(
             f"⚠️ เพลง **{getattr(track, 'title', 'Unknown')}** เล่นไม่ได้ "
@@ -2167,6 +2304,26 @@ async def on_wavelink_track_stuck(payload: wavelink.TrackStuckEventPayload):
         f"[track-stuck] {getattr(track, 'title', 'Unknown')} "
         f"threshold={getattr(payload, 'threshold', 'unknown')}ms"
     )
+    attempt = register_transient_track_retry(player, track)
+    if attempt == 0:
+        print("[recovery] stuck retry already pending")
+        return
+    if attempt:
+        delay = PLAYER_TRANSIENT_RETRY_DELAY_SECONDS
+        print(
+            f"[recovery] stuck track; retrying current track "
+            f"{attempt}/{PLAYER_TRANSIENT_RETRY_MAX} in {delay}s"
+        )
+        await asyncio.sleep(delay)
+        release_transient_retry(player, track)
+        await recover_player(
+            player,
+            reason=f"stuck track retry {attempt}",
+            replay_current=True,
+        )
+        return
+    clear_transient_track_retry(player)
+    print("[recovery] stuck retry limit reached; advancing the queue")
     try:
         await player.channel.send(
             f"⚠️ เพลง **{getattr(track, 'title', 'Unknown')}** ค้าง "

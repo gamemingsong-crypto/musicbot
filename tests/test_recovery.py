@@ -56,6 +56,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         main.bot.player_unhealthy_since.clear()
         main.bot.player_recovery_locks.clear()
         main.bot.player_resume_positions.clear()
+        main.bot.player_transient_retries.clear()
 
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")
@@ -121,6 +122,34 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         self.assertEqual(player.play_calls[0][1]["start"], 0)
+
+    def test_dns_failure_is_treated_as_transient(self):
+        exception = {
+            "message": "All clients failed",
+            "cause": "java.net.UnknownHostException: Temporary failure in name resolution",
+        }
+
+        self.assertTrue(main.is_transient_track_error(exception))
+        self.assertFalse(main.is_transient_track_error({"message": "Video unavailable"}))
+
+    def test_transient_retries_are_bounded(self):
+        track = FakeTrack("current")
+        player = FakePlayer(5, track)
+
+        attempts = []
+        for _ in range(main.PLAYER_TRANSIENT_RETRY_MAX + 1):
+            attempts.append(main.register_transient_track_retry(player, track))
+            main.release_transient_retry(player, track)
+
+        self.assertEqual(attempts[:-1], list(range(1, main.PLAYER_TRANSIENT_RETRY_MAX + 1)))
+        self.assertIsNone(attempts[-1])
+
+    def test_duplicate_transient_event_uses_pending_retry(self):
+        track = FakeTrack("current")
+        player = FakePlayer(6, track)
+
+        self.assertEqual(main.register_transient_track_retry(player, track), 1)
+        self.assertEqual(main.register_transient_track_retry(player, track), 0)
 
     def test_failed_track_end_is_ignored_once(self):
         player = object.__new__(FakePlayer)
