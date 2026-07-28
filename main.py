@@ -576,6 +576,27 @@ def should_ignore_manual_queue_jump_end(player, ended_track) -> bool:
     return False
 
 
+def mark_failed_track_recovery(player, track):
+    player._failed_track_recovery_key = track_identity(track)
+    player._failed_track_recovery_until = time.time() + 15
+
+
+def should_ignore_failed_track_end(player, ended_track) -> bool:
+    until = getattr(player, "_failed_track_recovery_until", 0)
+    if time.time() > until:
+        for attr in ("_failed_track_recovery_key", "_failed_track_recovery_until"):
+            if hasattr(player, attr):
+                delattr(player, attr)
+        return False
+
+    failed_key = getattr(player, "_failed_track_recovery_key", None)
+    ended_key = track_identity(ended_track)
+    if failed_key and ended_key == failed_key:
+        print("[recovery] ข้าม track_end ซ้ำของเพลงที่ระบบกู้ไปแล้ว")
+        return True
+    return False
+
+
 class TrackSelect(discord.ui.Select):
     def __init__(self, parent: "TrackSearchView"):
         self.parent_view = parent
@@ -904,6 +925,9 @@ PLAYBACK_STATUS_HEARTBEAT_SECONDS = 30  # refresh ไฟล์สถานะร
 QUEUE_REQUEST_POLL_SECONDS = 2
 EMPTY_VOICE_CHECK_SECONDS = 15
 EMPTY_VOICE_GRACE_SECONDS = 60
+PLAYER_HEALTH_CHECK_SECONDS = 15
+PLAYER_STALE_SECONDS = 45
+PLAYER_RECOVERY_MAX_ATTEMPTS = 3
 
 
 def queue_snapshot_from_player(player) -> list[dict]:
@@ -1084,6 +1108,134 @@ async def disconnect_empty_voice_player(player, channel, empty_seconds: float):
         f"🚪 ห้อง {getattr(channel, 'name', 'Unknown')} ไม่มีผู้ฟัง "
         f"{int(empty_seconds)} วิ ล้างคิวและออกจากห้องแล้ว"
     )
+
+
+async def force_disconnect_player(player, reason: str):
+    guild = getattr(player, "guild", None)
+    channel = getattr(player, "channel", None)
+    guild_id = getattr(guild, "id", None)
+    if guild_id:
+        bot.player_last_update.pop(guild_id, None)
+        bot.player_unhealthy_since.pop(guild_id, None)
+
+    try:
+        await player.disconnect()
+    except Exception as error:
+        print(f"[recovery] ตัด player ที่ค้างไม่สำเร็จ ({reason}): {error}")
+        cleanup = getattr(player, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+
+    bot_member = getattr(guild, "me", None) if guild else None
+    if bot_member and getattr(getattr(bot_member, "voice", None), "channel", None):
+        try:
+            await guild.change_voice_state(channel=None)
+        except discord.DiscordException as error:
+            print(f"[recovery] ล้างสถานะ Voice ของ Discord ไม่สำเร็จ: {error}")
+
+    write_bot_status(channel_name=None, track_title=None)
+    print(
+        f"[recovery] ล้าง player ค้างจาก {getattr(channel, 'name', 'Unknown')} "
+        f"เหตุผล: {reason}"
+    )
+
+
+async def recover_player(player, reason: str, replay_current: bool = False) -> bool:
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if not guild_id:
+        return False
+
+    lock = bot.player_recovery_locks.setdefault(guild_id, asyncio.Lock())
+    if lock.locked():
+        return False
+
+    async with lock:
+        current = getattr(player, "current", None)
+        queue = getattr(player, "queue", None)
+        candidate = current if replay_current and current else None
+
+        for _attempt in range(PLAYER_RECOVERY_MAX_ATTEMPTS):
+            if candidate is None:
+                if not queue or queue.is_empty:
+                    break
+                candidate = await queue.get_wait()
+            try:
+                await player.play(candidate)
+                bot.player_last_update[guild_id] = time.monotonic()
+                bot.player_unhealthy_since.pop(guild_id, None)
+                write_player_status(player)
+                print(
+                    f"[recovery] กู้เพลงสำเร็จใน {getattr(player.channel, 'name', 'Unknown')}: "
+                    f"{getattr(candidate, 'title', 'Unknown')} ({reason})"
+                )
+                return True
+            except Exception as error:
+                print(
+                    f"[recovery] เล่นเพลงระหว่างกู้ไม่สำเร็จ "
+                    f"{getattr(candidate, 'title', 'Unknown')}: {error}"
+                )
+                candidate = None
+
+        await force_disconnect_player(player, reason)
+        return False
+
+
+async def check_player_health():
+    now = time.monotonic()
+    active_guild_ids = set()
+
+    for player in list(bot.voice_clients):
+        guild = getattr(player, "guild", None)
+        channel = getattr(player, "channel", None)
+        if not guild or not channel:
+            continue
+
+        guild_id = guild.id
+        active_guild_ids.add(guild_id)
+        if not human_members_in_voice_channel(channel):
+            bot.player_unhealthy_since.pop(guild_id, None)
+            continue
+
+        current = getattr(player, "current", None)
+        playing = bool(getattr(player, "playing", False))
+        paused = bool(getattr(player, "paused", False))
+        connected = bool(getattr(player, "connected", False))
+        last_update = bot.player_last_update.setdefault(guild_id, now)
+        update_is_fresh = now - last_update < PLAYER_STALE_SECONDS
+
+        if paused or (connected and playing and current and update_is_fresh):
+            bot.player_unhealthy_since.pop(guild_id, None)
+            continue
+
+        unhealthy_started_at = (
+            last_update if current and not update_is_fresh else now
+        )
+        unhealthy_since = bot.player_unhealthy_since.setdefault(
+            guild_id,
+            unhealthy_started_at,
+        )
+        if now - unhealthy_since < PLAYER_STALE_SECONDS:
+            continue
+
+        queue = getattr(player, "queue", None)
+        has_queue = bool(queue and not queue.is_empty)
+        if current or has_queue:
+            await recover_player(
+                player,
+                reason="player watchdog พบว่าเสียงหยุดหรือสถานะไม่อัปเดต",
+                replay_current=bool(current),
+            )
+        else:
+            await force_disconnect_player(
+                player,
+                reason="player ไม่มีเพลงแต่ยังค้างอยู่ในห้อง",
+            )
+
+    for guild_id in list(bot.player_unhealthy_since):
+        if guild_id not in active_guild_ids:
+            bot.player_unhealthy_since.pop(guild_id, None)
+            bot.player_last_update.pop(guild_id, None)
 
 
 def save_dashboard_state(channel_id: int, message_id: int):
@@ -1369,6 +1521,9 @@ class OreoCloneBot(commands.Bot):
         self.dashboard_msg = None
         self.dashboard_last_signature = None
         self.empty_voice_since = {}
+        self.player_last_update = {}
+        self.player_unhealthy_since = {}
+        self.player_recovery_locks = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
@@ -1391,8 +1546,8 @@ class OreoCloneBot(commands.Bot):
         await self.change_presence(status=discord.Status.online, activity=listen_status)
         print(f'✅ พระเจ้า {self.user} ประทับร่าง และพร้อมลุยแล้ว!')
 
-        # เขียนสถานะเริ่มต้น (ว่าง) ทันทีที่บอทออนไลน์ กันไฟล์สถานะเก่าค้างจากรอบก่อน
-        write_bot_status(channel_name=None, track_title=None)
+        # ถ้าเป็น on_ready หลัง reconnect อย่าล้างสถานะเพลงที่อาจยังเล่นอยู่
+        refresh_current_playback_status()
 
         if not refresh_playback_status_task.is_running():
             refresh_playback_status_task.start()
@@ -1400,6 +1555,8 @@ class OreoCloneBot(commands.Bot):
             process_queue_requests_task.start()
         if not empty_voice_cleanup_task.is_running():
             empty_voice_cleanup_task.start()
+        if not player_health_watchdog_task.is_running():
+            player_health_watchdog_task.start()
 
         # เฉพาะบอทตัวที่ 1: กู้คืน Dashboard เดิม (ถ้ามี) แล้วเริ่ม loop อัปเดตสถานะรวม
         if self.bot_index == 1:
@@ -1416,6 +1573,21 @@ class OreoCloneBot(commands.Bot):
 
             if not update_shared_dashboard_task.is_running():
                 update_shared_dashboard_task.start()
+
+    async def on_disconnect(self):
+        now = time.monotonic()
+        print("[discord] Gateway หลุด กำลังรอเชื่อมต่อใหม่")
+        for player in list(self.voice_clients):
+            guild = getattr(player, "guild", None)
+            if guild:
+                self.player_unhealthy_since.setdefault(guild.id, now)
+
+    async def on_resumed(self):
+        print("[discord] Gateway กลับมาแล้ว กำลังตรวจ player ทุกห้อง")
+        for player in list(self.voice_clients):
+            guild = getattr(player, "guild", None)
+            if guild and guild.id not in self.player_last_update:
+                self.player_unhealthy_since.setdefault(guild.id, time.monotonic())
 
 bot = OreoCloneBot()
 
@@ -1456,6 +1628,14 @@ async def process_queue_requests_task():
 @tasks.loop(seconds=EMPTY_VOICE_CHECK_SECONDS)
 async def empty_voice_cleanup_task():
     await cleanup_empty_voice_channels()
+
+
+@tasks.loop(seconds=PLAYER_HEALTH_CHECK_SECONDS)
+async def player_health_watchdog_task():
+    try:
+        await check_player_health()
+    except Exception as error:
+        print(f"[watchdog] Player health watchdog ทำงานผิดพลาด: {error}")
 
 
 @tasks.loop(seconds=5)
@@ -1533,7 +1713,51 @@ def dashboard_author_icon_url() -> str:
 
 @bot.event
 async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
-    print(f"🔥 เครื่องยนต์ Lavalink เชื่อมต่อสำเร็จ! พร้อมกระแทกหูฟัง!")
+    resumed = bool(getattr(payload, "resumed", False))
+    print(
+        "[lavalink] เชื่อมต่อสำเร็จ "
+        f"resumed={resumed} session={getattr(payload, 'session_id', 'unknown')}"
+    )
+    if resumed:
+        return
+
+    now = time.monotonic()
+    for player in list(bot.voice_clients):
+        guild = getattr(player, "guild", None)
+        if guild:
+            bot.player_unhealthy_since[guild.id] = now - PLAYER_STALE_SECONDS
+
+
+@bot.event
+async def on_wavelink_node_closed(node, disconnected):
+    print(
+        f"[lavalink] node หลุด มี player ถูกตัด {len(disconnected or [])} ห้อง"
+    )
+    for player in disconnected or []:
+        await force_disconnect_player(player, "Lavalink node หลุดและกู้ session ไม่ได้")
+
+
+@bot.event
+async def on_wavelink_player_update(payload: wavelink.PlayerUpdateEventPayload):
+    player = payload.player
+    guild = getattr(player, "guild", None) if player else None
+    if not guild:
+        return
+    bot.player_last_update[guild.id] = time.monotonic()
+    bot.player_unhealthy_since.pop(guild.id, None)
+
+
+@bot.event
+async def on_wavelink_websocket_closed(payload: wavelink.WebsocketClosedEventPayload):
+    player = payload.player
+    guild = getattr(player, "guild", None) if player else None
+    print(
+        f"[voice] websocket ปิด code={getattr(payload, 'code', 'unknown')} "
+        f"remote={getattr(payload, 'by_remote', False)} "
+        f"reason={getattr(payload, 'reason', '')}"
+    )
+    if guild:
+        bot.player_unhealthy_since.setdefault(guild.id, time.monotonic())
 
 
 # ==================== 3. คลังคำสั่ง (Music Commands) ====================
@@ -1817,7 +2041,14 @@ async def stop(ctx: commands.Context):
 
 @bot.event
 async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
-    write_player_status(payload.player)
+    player = payload.player
+    if not player:
+        return
+    guild = getattr(player, "guild", None)
+    if guild:
+        bot.player_last_update[guild.id] = time.monotonic()
+        bot.player_unhealthy_since.pop(guild.id, None)
+    write_player_status(player)
 
 @bot.event
 async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
@@ -1827,19 +2058,68 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
 
     if should_ignore_manual_queue_jump_end(player, getattr(payload, "track", None)):
         return
+    if should_ignore_failed_track_end(player, getattr(payload, "track", None)):
+        return
 
+    reason = str(getattr(payload, "reason", "finished"))
     if not player.queue.is_empty:
-        next_track = await player.queue.get_wait()
-        await player.play(next_track)
-    else:
-        write_bot_status(channel_name=None, track_title=None)
-        try:
-            msg = await player.channel.send("✅ คิวหมดแล้ว! บอทขอตัวกลับสวรรค์ก่อนนะ 💨")
-            await msg.delete(delay=10)
-        except:
-            pass
-        finally:
-            await player.disconnect()
+        await recover_player(player, reason=f"track_end: {reason}")
+        return
+
+    write_bot_status(channel_name=None, track_title=None)
+    try:
+        msg = await player.channel.send("✅ คิวหมดแล้ว! บอทขอตัวกลับสวรรค์ก่อนนะ 💨")
+        await msg.delete(delay=10)
+    except discord.DiscordException:
+        pass
+    finally:
+        await force_disconnect_player(player, f"คิวหมด ({reason})")
+
+
+@bot.event
+async def on_wavelink_track_exception(payload: wavelink.TrackExceptionEventPayload):
+    player = payload.player
+    if not player:
+        return
+    track = getattr(payload, "track", None)
+    exception = getattr(payload, "exception", None)
+    mark_failed_track_recovery(player, track)
+    print(
+        f"[track-error] {getattr(track, 'title', 'Unknown')} "
+        f"severity={getattr(exception, 'severity', 'unknown')} "
+        f"message={getattr(exception, 'message', exception)}"
+    )
+    try:
+        await player.channel.send(
+            f"⚠️ เพลง **{getattr(track, 'title', 'Unknown')}** เล่นไม่ได้ "
+            "กำลังข้ามไปเพลงถัดไป...",
+            delete_after=10,
+        )
+    except discord.DiscordException:
+        pass
+    await recover_player(player, reason="track exception")
+
+
+@bot.event
+async def on_wavelink_track_stuck(payload: wavelink.TrackStuckEventPayload):
+    player = payload.player
+    if not player:
+        return
+    track = getattr(payload, "track", None)
+    mark_failed_track_recovery(player, track)
+    print(
+        f"[track-stuck] {getattr(track, 'title', 'Unknown')} "
+        f"threshold={getattr(payload, 'threshold', 'unknown')}ms"
+    )
+    try:
+        await player.channel.send(
+            f"⚠️ เพลง **{getattr(track, 'title', 'Unknown')}** ค้าง "
+            "กำลังข้ามไปเพลงถัดไป...",
+            delete_after=10,
+        )
+    except discord.DiscordException:
+        pass
+    await recover_player(player, reason="track stuck")
 
 
 def resolve_discord_token():
@@ -1867,9 +2147,14 @@ def resolve_discord_token():
 
 
 # ==================== 5. รันบอท ====================
-start_delay = int(os.getenv("BOT_START_DELAY", "0"))
-if start_delay > 0:
-    print(f"รอก่อนเริ่มบอท {start_delay} วินาที...")
-    time.sleep(start_delay)
+def main():
+    start_delay = int(os.getenv("BOT_START_DELAY", "0"))
+    if start_delay > 0:
+        print(f"รอก่อนเริ่มบอท {start_delay} วินาที...")
+        time.sleep(start_delay)
 
-bot.run(resolve_discord_token())
+    bot.run(resolve_discord_token())
+
+
+if __name__ == "__main__":
+    main()
