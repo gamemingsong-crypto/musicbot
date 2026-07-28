@@ -800,6 +800,7 @@ class TrackSearchView(discord.ui.View):
         self.add_item(self.prev_page)
         self.add_item(self.next_page)
         self.add_item(self.last_page)
+        self.add_item(self.add_all)
         self.add_item(self.cancel)
 
     def make_embed(self) -> discord.Embed:
@@ -870,6 +871,36 @@ class TrackSearchView(discord.ui.View):
     async def last_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = self.max_page
         await self.update_page(interaction)
+
+    @discord.ui.button(label="เพิ่มทั้งหมด", style=discord.ButtonStyle.success, row=2)
+    async def add_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        unique_tracks = []
+        seen = set()
+        for track in self.tracks:
+            key = track_identity(track)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            unique_tracks.append(track)
+
+        for track in unique_tracks:
+            await self.vc.queue.put_wait(track)
+
+        if not self.vc.playing and not getattr(self.vc, "current", None):
+            next_track = self.vc.queue.get()
+            await self.vc.play(next_track)
+
+        write_player_status(self.vc)
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content=f"📋 เพิ่มผลการค้นหาทั้งหมด **{len(unique_tracks)} เพลง** เข้าคิวแล้ว",
+            embed=None,
+            view=self,
+        )
+        self.stop()
 
     @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.danger, row=2)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
