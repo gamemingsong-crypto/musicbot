@@ -597,6 +597,44 @@ def should_ignore_failed_track_end(player, ended_track) -> bool:
     return False
 
 
+def remember_player_position(player, position_ms: int):
+    guild = getattr(player, "guild", None)
+    track = getattr(player, "current", None)
+    guild_id = getattr(guild, "id", None)
+    track_key = track_identity(track)
+    if not guild_id or not track_key:
+        return
+
+    try:
+        position_ms = max(0, int(position_ms))
+    except (TypeError, ValueError):
+        return
+
+    bot.player_resume_positions[guild_id] = {
+        "track_key": track_key,
+        "position_ms": position_ms,
+        "updated_at": time.monotonic(),
+    }
+
+
+def recovery_start_position(player, track) -> int:
+    guild = getattr(player, "guild", None)
+    guild_id = getattr(guild, "id", None)
+    if not guild_id or not track or getattr(track, "is_stream", False):
+        return 0
+
+    checkpoint = bot.player_resume_positions.get(guild_id)
+    if not checkpoint or checkpoint.get("track_key") != track_identity(track):
+        return 0
+
+    position_ms = max(0, int(checkpoint.get("position_ms", 0)))
+    start_ms = max(0, position_ms - PLAYER_RESUME_REWIND_MS)
+    length_ms = getattr(track, "length", None)
+    if length_ms:
+        start_ms = min(start_ms, max(0, int(length_ms) - 1000))
+    return start_ms
+
+
 class TrackSelect(discord.ui.Select):
     def __init__(self, parent: "TrackSearchView"):
         self.parent_view = parent
@@ -928,6 +966,7 @@ EMPTY_VOICE_GRACE_SECONDS = 60
 PLAYER_HEALTH_CHECK_SECONDS = 15
 PLAYER_STALE_SECONDS = 45
 PLAYER_RECOVERY_MAX_ATTEMPTS = 3
+PLAYER_RESUME_REWIND_MS = max(0, int(os.getenv("PLAYER_RESUME_REWIND_MS", "3000")))
 
 
 def queue_snapshot_from_player(player) -> list[dict]:
@@ -1117,6 +1156,7 @@ async def force_disconnect_player(player, reason: str):
     if guild_id:
         bot.player_last_update.pop(guild_id, None)
         bot.player_unhealthy_since.pop(guild_id, None)
+        bot.player_resume_positions.pop(guild_id, None)
 
     try:
         await player.disconnect()
@@ -1160,14 +1200,26 @@ async def recover_player(player, reason: str, replay_current: bool = False) -> b
                 if not queue or queue.is_empty:
                     break
                 candidate = await queue.get_wait()
+            replaying_current = bool(
+                replay_current
+                and current
+                and track_identity(candidate) == track_identity(current)
+            )
+            start_ms = recovery_start_position(player, candidate) if replaying_current else 0
             try:
-                await player.play(candidate)
+                await player.play(
+                    candidate,
+                    start=start_ms,
+                    add_history=not replaying_current,
+                )
                 bot.player_last_update[guild_id] = time.monotonic()
                 bot.player_unhealthy_since.pop(guild_id, None)
+                remember_player_position(player, start_ms)
                 write_player_status(player)
+                resume_note = f" from {start_ms / 1000:.1f}s" if start_ms else ""
                 print(
                     f"[recovery] กู้เพลงสำเร็จใน {getattr(player.channel, 'name', 'Unknown')}: "
-                    f"{getattr(candidate, 'title', 'Unknown')} ({reason})"
+                    f"{getattr(candidate, 'title', 'Unknown')}{resume_note} ({reason})"
                 )
                 return True
             except Exception as error:
@@ -1236,6 +1288,7 @@ async def check_player_health():
         if guild_id not in active_guild_ids:
             bot.player_unhealthy_since.pop(guild_id, None)
             bot.player_last_update.pop(guild_id, None)
+            bot.player_resume_positions.pop(guild_id, None)
 
 
 def save_dashboard_state(channel_id: int, message_id: int):
@@ -1524,6 +1577,7 @@ class OreoCloneBot(commands.Bot):
         self.player_last_update = {}
         self.player_unhealthy_since = {}
         self.player_recovery_locks = {}
+        self.player_resume_positions = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
@@ -1745,6 +1799,7 @@ async def on_wavelink_player_update(payload: wavelink.PlayerUpdateEventPayload):
         return
     bot.player_last_update[guild.id] = time.monotonic()
     bot.player_unhealthy_since.pop(guild.id, None)
+    remember_player_position(player, getattr(payload, "position", 0))
 
 
 @bot.event
@@ -2048,6 +2103,7 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if guild:
         bot.player_last_update[guild.id] = time.monotonic()
         bot.player_unhealthy_since.pop(guild.id, None)
+        remember_player_position(player, 0)
     write_player_status(player)
 
 @bot.event

@@ -4,9 +4,11 @@ import main
 
 
 class FakeTrack:
-    def __init__(self, identifier):
+    def __init__(self, identifier, *, length=180_000, is_stream=False):
         self.identifier = identifier
         self.title = identifier
+        self.length = length
+        self.is_stream = is_stream
 
 
 class FakeQueue:
@@ -38,9 +40,11 @@ class FakePlayer:
         self.queue = FakeQueue(*queued)
         self.fail_first = fail_first
         self.played = []
+        self.play_calls = []
 
-    async def play(self, track):
+    async def play(self, track, **kwargs):
         self.played.append(track)
+        self.play_calls.append((track, kwargs))
         if self.fail_first and len(self.played) == 1:
             raise RuntimeError("test failure")
         self.current = track
@@ -51,6 +55,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         main.bot.player_last_update.clear()
         main.bot.player_unhealthy_since.clear()
         main.bot.player_recovery_locks.clear()
+        main.bot.player_resume_positions.clear()
 
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")
@@ -67,6 +72,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered)
         self.assertEqual(player.played, [current])
         self.assertEqual(player.queue.tracks, [queued_one, queued_two])
+        self.assertEqual(player.play_calls[0][1]["start"], 0)
+        self.assertFalse(player.play_calls[0][1]["add_history"])
 
     async def test_failed_replay_advances_only_one_queue_item(self):
         current = FakeTrack("current")
@@ -83,6 +90,37 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered)
         self.assertEqual(player.played, [current, queued_one])
         self.assertEqual(player.queue.tracks, [queued_two])
+        self.assertEqual(player.play_calls[1][1]["start"], 0)
+        self.assertTrue(player.play_calls[1][1]["add_history"])
+
+    async def test_replay_current_resumes_from_last_checkpoint(self):
+        current = FakeTrack("current")
+        player = FakePlayer(3, current)
+        main.remember_player_position(player, 60_000)
+
+        recovered = await main.recover_player(
+            player,
+            reason="network interruption",
+            replay_current=True,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(player.play_calls[0][1]["start"], 57_000)
+        self.assertFalse(player.play_calls[0][1]["add_history"])
+
+    async def test_live_stream_recovery_starts_from_zero(self):
+        current = FakeTrack("live", is_stream=True)
+        player = FakePlayer(4, current)
+        main.remember_player_position(player, 60_000)
+
+        recovered = await main.recover_player(
+            player,
+            reason="network interruption",
+            replay_current=True,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(player.play_calls[0][1]["start"], 0)
 
     def test_failed_track_end_is_ignored_once(self):
         player = object.__new__(FakePlayer)
