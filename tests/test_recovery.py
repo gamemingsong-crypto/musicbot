@@ -202,6 +202,20 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(node._websocket.connect_calls, 1)
 
+    async def test_missing_loading_message_does_not_abort_command(self):
+        class FakeResponse:
+            status = 404
+            reason = "Not Found"
+
+        class MissingMessage:
+            async def delete(self, *, delay=None):
+                raise main.discord.NotFound(
+                    FakeResponse(),
+                    {"code": 10008, "message": "Unknown Message"},
+                )
+
+        await main.safe_delete_message(MissingMessage())
+
     def test_failed_track_end_is_ignored_once(self):
         player = object.__new__(FakePlayer)
         track = FakeTrack("failed")

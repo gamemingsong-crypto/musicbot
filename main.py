@@ -526,6 +526,17 @@ def trim_discord_label(text: str, limit: int = 100) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+async def safe_delete_message(message, *, delay: float | None = None):
+    if not message:
+        return
+    try:
+        await message.delete(delay=delay)
+    except discord.NotFound:
+        pass
+    except discord.HTTPException as error:
+        print(f"[discord] temporary message cleanup failed: {error}")
+
+
 def track_identity(track) -> str | None:
     if not track:
         return None
@@ -2146,11 +2157,11 @@ async def play(ctx: commands.Context, *, search: str):
                 deezer_tracks = await fetch_deezer_track_names(session, kind, deezer_id)
 
             if not deezer_tracks:
-                await loading_msg.delete()
+                await safe_delete_message(loading_msg)
                 return await ctx.send("❌ ดึงข้อมูลจาก Deezer ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
 
             added_count, first_track_title = await queue_track_infos(vc, deezer_tracks)
-            await loading_msg.delete()
+            await safe_delete_message(loading_msg)
 
             if added_count == 0:
                 return await ctx.send("❌ หาเพลงจาก Deezer บน YouTube ไม่เจอเลยสักเพลง")
@@ -2173,11 +2184,11 @@ async def play(ctx: commands.Context, *, search: str):
                 apple_tracks = await fetch_apple_music_track_names(session, kind, apple_id, track_id, search)
 
             if not apple_tracks:
-                await loading_msg.delete()
+                await safe_delete_message(loading_msg)
                 return await ctx.send("❌ ดึงข้อมูลจาก Apple Music ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
 
             added_count, first_track_title = await queue_track_infos(vc, apple_tracks)
-            await loading_msg.delete()
+            await safe_delete_message(loading_msg)
 
             if added_count == 0:
                 return await ctx.send("❌ หาเพลงจาก Apple Music บน YouTube ไม่เจอเลยสักเพลง")
@@ -2200,11 +2211,11 @@ async def play(ctx: commands.Context, *, search: str):
                 spotify_tracks = await fetch_spotify_track_names(session, kind, spotify_id)
 
             if not spotify_tracks:
-                await loading_msg.delete()
+                await safe_delete_message(loading_msg)
                 return await ctx.send("❌ ดึงข้อมูลจาก Spotify ไม่ได้ ลองเช็คลิงก์อีกครั้ง")
 
             added_count, first_track_title = await queue_track_infos(vc, spotify_tracks)
-            await loading_msg.delete()
+            await safe_delete_message(loading_msg)
 
             if added_count == 0:
                 return await ctx.send("❌ หาเพลงจาก Spotify บน YouTube ไม่เจอเลยสักเพลง")
