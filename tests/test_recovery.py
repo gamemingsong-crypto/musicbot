@@ -254,10 +254,12 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             embed = main.build_shared_dashboard_embed()
 
         self.assertEqual(embed.description.count("```text"), 4)
-        self.assertIn("**BOT 1**", embed.description)
+        self.assertIn("**Pork Hyun Radio**", embed.description)
         self.assertIn("ROOM   : Music Room 1", embed.description)
         self.assertIn("LISTEN : Test Song", embed.description)
-        self.assertIn("**BOT 4**", embed.description)
+        self.assertIn("**Pork Hyun Radioo**", embed.description)
+        self.assertIn("**Pork Hyun Radiooo**", embed.description)
+        self.assertIn("**Pork Hyun Radioooo**", embed.description)
         self.assertEqual(embed.description.count("STATUS : IDLE"), 3)
 
 

@@ -1569,6 +1569,12 @@ def build_shared_dashboard_embed() -> discord.Embed:
     """Build the shared dashboard with one clearly separated panel per bot."""
     now = time.time()
     panels = []
+    bot_display_names = (
+        "Pork Hyun Radio",
+        "Pork Hyun Radioo",
+        "Pork Hyun Radiooo",
+        "Pork Hyun Radioooo",
+    )
 
     for idx in range(1, bot.bot_count + 1):
         path = os.path.join(STATUS_DIR, f"bot_{idx}.json")
@@ -1595,7 +1601,12 @@ def build_shared_dashboard_embed() -> discord.Embed:
         else:
             details = "ROOM   : -\nSTATUS : IDLE"
 
-        panels.append(f"**BOT {idx}**\n```text\n{details}\n```")
+        display_name = (
+            bot_display_names[idx - 1]
+            if idx <= len(bot_display_names)
+            else f"BOT {idx}"
+        )
+        panels.append(f"**{display_name}**\n```text\n{details}\n```")
 
     embed = discord.Embed(
         description="\n".join(panels),
