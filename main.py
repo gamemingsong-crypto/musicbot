@@ -1566,19 +1566,11 @@ def load_dashboard_state():
 
 
 def build_shared_dashboard_embed() -> discord.Embed:
-    """Updates when the song changes (1..bot_count) ?????????????? Dashboard ?????"""
+    """Build the shared dashboard with one clearly separated panel per bot."""
     now = time.time()
-    lines = []
-    border = "+----------------------------------------+"
-
-    def box_line(text: str) -> str:
-        content = trim_discord_label(text, 38)
-        return f"| {content.ljust(38)} |"
+    panels = []
 
     for idx in range(1, bot.bot_count + 1):
-        if lines:
-            lines.append(border)
-
         path = os.path.join(STATUS_DIR, f"bot_{idx}.json")
         status = None
         if os.path.exists(path):
@@ -1591,21 +1583,22 @@ def build_shared_dashboard_embed() -> discord.Embed:
         is_fresh = status is not None and (now - status.get("updated_at", 0)) < STATUS_STALE_SECONDS
 
         if is_fresh and status.get("track_title"):
-            channel_name = trim_discord_label(status.get("channel_name") or "Unknown", 20)
-            track_title = trim_discord_label(status["track_title"], 32)
-            lines.append(box_line(f"ROOM: {channel_name} | BOT {idx}"))
-            lines.append(box_line(f"LISTEN: {track_title}"))
+            channel_name = trim_discord_label(
+                status.get("channel_name") or "Unknown",
+                32,
+            )
+            track_title = trim_discord_label(status["track_title"], 48)
+            details = (
+                f"ROOM   : {channel_name}\n"
+                f"LISTEN : {track_title}"
+            )
         else:
-            lines.append(box_line(f"ROOM: - | BOT {idx} | IDLE"))
+            details = "ROOM   : -\nSTATUS : IDLE"
 
-    status_box = "\n".join([
-        border,
-        *lines,
-        border,
-    ])
+        panels.append(f"**BOT {idx}**\n```text\n{details}\n```")
 
     embed = discord.Embed(
-        description=f"```text\n{status_box}\n```",
+        description="\n".join(panels),
         color=0xffa500,
     )
     embed.set_author(

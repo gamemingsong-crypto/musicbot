@@ -1,4 +1,9 @@
+import json
+import os
+import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 import main
 
@@ -225,6 +230,35 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             main.should_ignore_failed_track_end(player, FakeTrack("different"))
         )
+
+    def test_dashboard_uses_one_separate_panel_per_music_bot(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            main,
+            "STATUS_DIR",
+            directory,
+        ), patch.object(main.bot, "bot_count", 4):
+            with open(
+                os.path.join(directory, "bot_1.json"),
+                "w",
+                encoding="utf-8",
+            ) as status_file:
+                json.dump(
+                    {
+                        "updated_at": time.time(),
+                        "channel_name": "Music Room 1",
+                        "track_title": "Test Song",
+                    },
+                    status_file,
+                )
+
+            embed = main.build_shared_dashboard_embed()
+
+        self.assertEqual(embed.description.count("```text"), 4)
+        self.assertIn("**BOT 1**", embed.description)
+        self.assertIn("ROOM   : Music Room 1", embed.description)
+        self.assertIn("LISTEN : Test Song", embed.description)
+        self.assertIn("**BOT 4**", embed.description)
+        self.assertEqual(embed.description.count("STATUS : IDLE"), 3)
 
 
 if __name__ == "__main__":
