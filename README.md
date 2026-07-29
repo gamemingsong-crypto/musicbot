@@ -14,7 +14,8 @@ Discord music system with four bots, one Lavalink node, shared dashboard, queue 
 - `!remove <position>`: Remove a queued track by its displayed number.
 - `!skip`: Vote to skip the current track.
 - `!forceskip`: Force a skip (Manage Server permission required).
-- `!lyrics`: Show lyrics for the current track.
+- `/lyrics`: Show lyrics for the current track privately with Discord's Close Message control.
+- `!lyrics`: Open a requester-only button for the same private lyrics view.
 - `!sponsorblock`: Show SponsorBlock status.
 - `!sponsorblock on|off`: Change SponsorBlock status (Manage Server permission required).
 - `!clear`: Clear queued tracks.

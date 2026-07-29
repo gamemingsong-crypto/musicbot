@@ -67,6 +67,7 @@ MUSIC_VOICE_CHANNEL_NAMES = parse_channel_names(
     os.getenv("MUSIC_VOICE_CHANNEL_NAMES"),
     tuple(f"Music Room {index}" for index in range(1, 5)),
 )
+MUSIC_GUILD_ID = int(os.getenv("MUSIC_GUILD_ID", "1508483093474836531"))
 
 
 def is_music_request_channel(channel) -> bool:
@@ -1896,6 +1897,14 @@ class OreoCloneBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
+        try:
+            guild = discord.Object(id=MUSIC_GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} application command(s) to guild {MUSIC_GUILD_ID}")
+        except discord.HTTPException as error:
+            print(f"Application command sync failed: {error}")
+
         retries = int(os.getenv("LAVALINK_CONNECT_RETRIES", "30"))
         delay = int(os.getenv("LAVALINK_CONNECT_DELAY", "5"))
         lavalink_password = os.getenv("LAVALINK_PASSWORD")
@@ -2182,6 +2191,27 @@ def lyrics_text(payload: dict) -> str | None:
         if str(line.get("line", "")).strip()
     )
     return text or None
+
+
+def build_lyrics_embed(payload: dict, track_title: str) -> discord.Embed | None:
+    text = lyrics_text(payload)
+    if not text:
+        return None
+
+    limit = 3800
+    truncated = len(text) > limit
+    shown = text[:limit].rsplit("\n", 1)[0] if truncated else text
+    embed = discord.Embed(
+        title=f"🎤 {trim_discord_label(track_title, 180)}",
+        description=shown,
+        color=0xffa500,
+    )
+    source = payload.get("source")
+    footer = f"Source: {source}" if source else "Lyrics"
+    if truncated:
+        footer += " | เนื้อเพลงยาวเกินไป จึงแสดงเฉพาะส่วนแรก"
+    embed.set_footer(text=footer)
+    return embed
 
 
 @bot.event
@@ -2638,36 +2668,109 @@ async def clear_queue(ctx: commands.Context):
     await msg.delete(delay=5)
 
 
-@bot.command(name='lyrics', aliases=['lyric'])
+async def send_player_lyrics_ephemeral(
+    interaction: discord.Interaction,
+    player: wavelink.Player,
+):
+    payload = await fetch_player_lyrics(player)
+    embed = build_lyrics_embed(payload or {}, player.current.title)
+    if embed is None:
+        return await send_ephemeral_followup(
+            interaction,
+            "private lyrics not found",
+            "ไม่พบเนื้อเพลงสำหรับเพลงนี้ครับ",
+        )
+
+    await send_ephemeral_followup(
+        interaction,
+        "private lyrics",
+        embed=embed,
+    )
+
+
+class LyricsRequestView(discord.ui.View):
+    def __init__(self, requester_id: int):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+
+    @discord.ui.button(
+        label="ดูเนื้อเพลง",
+        style=discord.ButtonStyle.primary,
+        emoji="🎤",
+        custom_id="music:lyrics:show",
+    )
+    async def show_lyrics(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if interaction.user.id != self.requester_id:
+            return await interaction.response.send_message(
+                "ปุ่มนี้ใช้ได้เฉพาะผู้ที่ขอเนื้อเพลงครับ",
+                ephemeral=True,
+            )
+
+        if not await defer_ephemeral_interaction(interaction, "private lyrics button"):
+            return
+
+        voice_state = getattr(interaction.user, "voice", None)
+        voice_channel = getattr(voice_state, "channel", None)
+        player = interaction.guild.voice_client if interaction.guild else None
+        if (
+            not voice_channel
+            or not is_this_bot_assigned_to_voice_channel(voice_channel)
+            or not player
+            or not player.current
+            or getattr(player, "channel", None) != voice_channel
+        ):
+            return await send_ephemeral_followup(
+                interaction,
+                "private lyrics unavailable",
+                "ไม่พบบอทเพลงที่กำลังเล่นอยู่ในห้องเสียงของคุณครับ",
+            )
+
+        await send_player_lyrics_ephemeral(interaction, player)
+
+
+@bot.hybrid_command(
+    name='lyrics',
+    aliases=['lyric'],
+    description='ดูเนื้อเพลงที่กำลังเล่นแบบส่วนตัว',
+)
 async def lyrics(ctx: commands.Context):
+    is_application_command = ctx.interaction is not None
     if not should_handle_music_command(ctx):
+        if is_application_command:
+            await ctx.send(
+                "ไม่พบบอทเพลงที่กำลังเล่นอยู่ในห้องเสียงของคุณครับ",
+                ephemeral=True,
+            )
         return
 
     vc: wavelink.Player = ctx.voice_client
     if not vc or not vc.current:
-        return await ctx.send("❌ ตอนนี้ยังไม่มีเพลงสำหรับค้นหาเนื้อเพลงครับ")
+        if is_application_command:
+            return await ctx.send(
+                "❌ ตอนนี้ยังไม่มีเพลงสำหรับค้นหาเนื้อเพลงครับ",
+                ephemeral=True,
+            )
+        await safe_delete_message(ctx.message)
+        return await ctx.send(
+            "❌ ตอนนี้ยังไม่มีเพลงสำหรับค้นหาเนื้อเพลงครับ",
+            delete_after=10,
+        )
 
-    loading = await ctx.send("🔎 กำลังค้นหาเนื้อเพลง...")
-    payload = await fetch_player_lyrics(vc)
-    await safe_delete_message(loading)
-    text = lyrics_text(payload or {})
-    if not text:
-        return await ctx.send("ไม่พบเนื้อเพลงสำหรับเพลงนี้ครับ", delete_after=10)
+    if is_application_command:
+        await ctx.defer(ephemeral=True)
+        return await send_player_lyrics_ephemeral(ctx.interaction, vc)
 
-    limit = 3800
-    truncated = len(text) > limit
-    shown = text[:limit].rsplit("\n", 1)[0] if truncated else text
-    embed = discord.Embed(
-        title=f"🎤 {trim_discord_label(vc.current.title, 180)}",
-        description=shown,
-        color=0xffa500,
+    await safe_delete_message(ctx.message)
+    await ctx.send(
+        f"{ctx.author.mention} กดปุ่มเพื่อดูเนื้อเพลงแบบส่วนตัว",
+        view=LyricsRequestView(ctx.author.id),
+        delete_after=60,
+        allowed_mentions=discord.AllowedMentions(users=[ctx.author]),
     )
-    source = payload.get("source")
-    footer = f"Source: {source}" if source else "Lyrics"
-    if truncated:
-        footer += " | เนื้อเพลงยาวเกินไป จึงแสดงเฉพาะส่วนแรก"
-    embed.set_footer(text=footer)
-    await ctx.send(embed=embed)
 
 
 @bot.command(name='sponsorblock', aliases=['sb'])

@@ -214,6 +214,24 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             "one\ntwo",
         )
 
+    async def test_private_lyrics_view_has_a_requester_button(self):
+        view = main.LyricsRequestView(123)
+
+        self.assertEqual(view.requester_id, 123)
+        self.assertEqual(len(view.children), 1)
+        self.assertEqual(view.children[0].custom_id, "music:lyrics:show")
+        self.assertEqual(view.children[0].label, "ดูเนื้อเพลง")
+
+    def test_lyrics_embed_is_ready_for_private_interactions(self):
+        embed = main.build_lyrics_embed(
+            {"type": "text", "text": "first line\nsecond line", "source": "test"},
+            "Test Song",
+        )
+
+        self.assertEqual(embed.title, "🎤 Test Song")
+        self.assertEqual(embed.description, "first line\nsecond line")
+        self.assertEqual(embed.footer.text, "Source: test")
+
     async def test_dead_wavelink_websocket_is_reconnected(self):
         class FakeTask:
             def __init__(self, done):
