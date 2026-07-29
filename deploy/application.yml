@@ -28,6 +28,7 @@ plugins:
       userAgent: "PorkHyun-Lavalink"
     clients:
       - MUSIC
+      - TV
       - TVHTML5_SIMPLY
       - ANDROID_VR
       - WEBEMBEDDED
