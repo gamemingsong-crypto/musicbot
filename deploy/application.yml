@@ -1,0 +1,63 @@
+server:
+  port: 2333
+  address: 127.0.0.1
+
+lavalink:
+  plugins:
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      repository: "https://maven.lavalink.dev/releases"
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
+      repository: "https://maven.lavalink.dev/releases"
+    - dependency: "com.github.topi314.sponsorblock:sponsorblock-plugin:3.0.1"
+      repository: "https://maven.lavalink.dev/releases"
+    - dependency: "me.duncte123:java-lyrics-plugin:1.6.6"
+      repository: "https://maven.lavalink.dev/releases"
+  server:
+    password: "${LAVALINK_PASSWORD}"
+    sources:
+      youtube: false
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "PorkHyun-Lavalink"
+    clients:
+      - MUSIC
+      - TVHTML5_SIMPLY
+      - ANDROID_VR
+      - WEBEMBEDDED
+      - WEB
+    oauth:
+      enabled: true
+      refreshToken: "${YOUTUBE_REFRESH_TOKEN}"
+      skipInitialization: true
+
+  lavasrc:
+    providers:
+      - "ytsearch:\"%ISRC%\""
+      - "ytsearch:%QUERY%"
+    sources:
+      spotify: true
+      applemusic: false
+      deezer: false
+    spotify:
+      clientId: "${SPOTIFY_CLIENT_ID}"
+      clientSecret: "${SPOTIFY_CLIENT_SECRET}"
+      countryCode: "TH"
+
+  lyrics:
+    countryCode: "TH"
+
+logging:
+  file:
+    path: ./logs/
+    max-history: 1
+    max-size: 10MB
+  level:
+    root: INFO
+    lavalink: INFO

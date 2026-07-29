@@ -19,6 +19,16 @@ RUNTIME_ARG_PARSER.add_argument("--bot-index", type=int, default=int(os.getenv("
 RUNTIME_ARG_PARSER.add_argument("--token-env", default=os.getenv("DISCORD_TOKEN_ENV"))
 RUNTIME_ARGS, _ = RUNTIME_ARG_PARSER.parse_known_args()
 
+LAVALINK_URI = os.getenv("LAVALINK_URI", "http://127.0.0.1:2333").rstrip("/")
+SPONSORBLOCK_CATEGORIES = tuple(
+    category.strip()
+    for category in os.getenv(
+        "SPONSORBLOCK_CATEGORIES",
+        "sponsor,selfpromo,interaction",
+    ).split(",")
+    if category.strip()
+)
+
 
 def parse_channel_ids(value: str | None) -> tuple[int, ...]:
     channel_ids = []
@@ -517,6 +527,52 @@ def format_duration(track) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_milliseconds(duration_ms: int | float | None) -> str:
+    if duration_ms is None:
+        return "--:--"
+    total_seconds = max(0, int(duration_ms / 1000))
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def playback_progress_bar(position_ms: int, length_ms: int, width: int = 16) -> str:
+    if length_ms <= 0:
+        return "LIVE"
+    ratio = min(1.0, max(0.0, position_ms / length_ms))
+    marker = min(width - 1, int(ratio * width))
+    return "=" * marker + "o" + "-" * (width - marker - 1)
+
+
+def queue_has_next_track(queue) -> bool:
+    if not queue:
+        return False
+    if not getattr(queue, "is_empty", True):
+        return True
+
+    mode = getattr(queue, "mode", wavelink.QueueMode.normal)
+    if mode is wavelink.QueueMode.loop and getattr(queue, "loaded", None):
+        return True
+
+    history = getattr(queue, "history", None)
+    return bool(
+        mode is wavelink.QueueMode.loop_all
+        and history
+        and not getattr(history, "is_empty", True)
+    )
+
+
+def queue_mode_name(queue) -> str:
+    mode = getattr(queue, "mode", wavelink.QueueMode.normal)
+    return {
+        wavelink.QueueMode.normal: "off",
+        wavelink.QueueMode.loop: "track",
+        wavelink.QueueMode.loop_all: "queue",
+    }.get(mode, "off")
 
 
 def trim_discord_label(text: str, limit: int = 100) -> str:
@@ -1383,6 +1439,7 @@ async def force_disconnect_player(player, reason: str):
         bot.player_unhealthy_since.pop(guild_id, None)
         bot.player_resume_positions.pop(guild_id, None)
         bot.player_transient_retries.pop(guild_id, None)
+        bot.skip_votes.pop(guild_id, None)
 
     try:
         await player.disconnect()
@@ -1423,7 +1480,7 @@ async def recover_player(player, reason: str, replay_current: bool = False) -> b
 
         for _attempt in range(PLAYER_RECOVERY_MAX_ATTEMPTS):
             if candidate is None:
-                if not queue or queue.is_empty:
+                if not queue_has_next_track(queue):
                     break
                 candidate = await queue.get_wait()
             replaying_current = bool(
@@ -1841,15 +1898,20 @@ class OreoCloneBot(commands.Bot):
         self.player_transient_retries = {}
         self.voice_connect_locks = {}
         self.node_reconnect_locks = {}
+        self.skip_votes = {}
+        self.sponsorblock_enabled = {}
 
     async def setup_hook(self):
         self.add_view(MusicDashboard())
         retries = int(os.getenv("LAVALINK_CONNECT_RETRIES", "30"))
         delay = int(os.getenv("LAVALINK_CONNECT_DELAY", "5"))
+        lavalink_password = os.getenv("LAVALINK_PASSWORD")
+        if not lavalink_password:
+            raise RuntimeError("LAVALINK_PASSWORD is required in .env")
 
         for attempt in range(1, retries + 1):
             try:
-                nodes = [wavelink.Node(uri="http://127.0.0.1:2333", password="youshallnotpass")]
+                nodes = [wavelink.Node(uri=LAVALINK_URI, password=lavalink_password)]
                 await wavelink.Pool.connect(client=self, nodes=nodes)
                 return
             except Exception as e:
@@ -1908,6 +1970,15 @@ class OreoCloneBot(commands.Bot):
                 self.player_unhealthy_since.setdefault(guild.id, time.monotonic())
 
     async def close(self):
+        for loop in (
+            refresh_playback_status_task,
+            process_queue_requests_task,
+            empty_voice_cleanup_task,
+            player_health_watchdog_task,
+            update_shared_dashboard_task,
+        ):
+            if loop.is_running():
+                loop.cancel()
         try:
             await wavelink.Pool.close()
         except Exception as error:
@@ -1935,6 +2006,15 @@ async def music_commands_only_in_request_channel(ctx: commands.Context) -> bool:
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ คำสั่งนี้ใช้ได้เฉพาะผู้ดูแลเซิร์ฟเวอร์ครับ", delete_after=8)
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("❌ ใส่ข้อมูลของคำสั่งไม่ครบ ลองใช้ `!musichelp` ครับ", delete_after=8)
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("❌ รูปแบบข้อมูลไม่ถูกต้อง ลองใช้ `!musichelp` ครับ", delete_after=8)
+        return
     if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
         return
     raise error
@@ -2035,6 +2115,80 @@ def dashboard_author_icon_url() -> str:
         return bot.user.display_avatar.url
 
     return "https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExa2VyejJwZ2tmNGhzcTNoejN6ZjJzOG9pcHBxOTVzOTNwc2Fyb3k0MyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9cw/xKi7t0cYQwTLA69YYY/giphy.gif"
+
+
+def lavalink_request_headers() -> dict[str, str]:
+    password = os.getenv("LAVALINK_PASSWORD")
+    if not password:
+        raise RuntimeError("LAVALINK_PASSWORD is required in .env")
+    return {"Authorization": password}
+
+
+def player_plugin_url(player, suffix: str) -> str:
+    node = getattr(player, "node", None)
+    session_id = getattr(node, "session_id", None)
+    guild = getattr(player, "guild", None)
+    if not node or not session_id or not guild:
+        raise RuntimeError("Lavalink player session is not ready")
+    base_uri = str(getattr(node, "uri", LAVALINK_URI)).rstrip("/")
+    return f"{base_uri}/v4/sessions/{session_id}/players/{guild.id}/{suffix.lstrip('/')}"
+
+
+async def configure_sponsorblock(player, enabled: bool) -> bool:
+    url = player_plugin_url(player, "sponsorblock/categories")
+    timeout = aiohttp.ClientTimeout(total=8)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if enabled:
+                response = await session.put(
+                    url,
+                    headers=lavalink_request_headers(),
+                    json=list(SPONSORBLOCK_CATEGORIES),
+                )
+            else:
+                response = await session.delete(
+                    url,
+                    headers=lavalink_request_headers(),
+                )
+            async with response:
+                if response.status in (200, 204):
+                    return True
+                body = await response.text()
+                print(f"[sponsorblock] HTTP {response.status}: {body[:200]}")
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as error:
+        print(f"[sponsorblock] configure failed: {error}")
+    return False
+
+
+async def fetch_player_lyrics(player) -> dict | None:
+    url = player_plugin_url(player, "lyrics")
+    timeout = aiohttp.ClientTimeout(total=12)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=lavalink_request_headers()) as response:
+                if response.status in (204, 404):
+                    return None
+                if response.status != 200:
+                    body = await response.text()
+                    print(f"[lyrics] HTTP {response.status}: {body[:200]}")
+                    return None
+                return await response.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as error:
+        print(f"[lyrics] fetch failed: {error}")
+        return None
+
+
+def lyrics_text(payload: dict) -> str | None:
+    if payload.get("type") == "text":
+        return payload.get("text")
+
+    lines = payload.get("lines") or []
+    text = "\n".join(
+        str(line.get("line", "")).strip()
+        for line in lines
+        if str(line.get("line", "")).strip()
+    )
+    return text or None
 
 
 @bot.event
@@ -2277,17 +2431,49 @@ async def play(ctx: commands.Context, *, search: str):
         print(f"Error: {e}")
 
 
-@bot.command(name='skip', aliases=['s'])
-async def skip(ctx: commands.Context):
+@bot.command(name='skip', aliases=['s', 'voteskip', 'vs'])
+async def vote_skip(ctx: commands.Context):
     if not should_handle_music_command(ctx):
         return
 
     vc: wavelink.Player = ctx.voice_client
     if not vc or not vc.playing:
-        return await ctx.send("❌ ไม่มีเพลงให้ข้ามเว้ย!")
-    await vc.stop()
-    msg = await ctx.send("⏭️ ข้ามเพลงให้แล้ว!")
-    await msg.delete(delay=5)
+        return await ctx.send("❌ ไม่มีเพลงให้โหวตข้ามครับ")
+
+    if ctx.author not in human_members_in_voice_channel(vc.channel):
+        return await ctx.send("❌ ต้องอยู่ในห้องเสียงเดียวกับบอทก่อนครับ")
+
+    human_ids = {member.id for member in human_members_in_voice_channel(vc.channel)}
+    votes = bot.skip_votes.setdefault(ctx.guild.id, set())
+    votes.intersection_update(human_ids)
+    if ctx.author.id in votes:
+        return await ctx.send("คุณโหวตข้ามเพลงนี้ไปแล้วครับ", delete_after=5)
+
+    votes.add(ctx.author.id)
+    required = max(1, (len(human_ids) // 2) + 1)
+    if len(votes) < required:
+        return await ctx.send(
+            f"⏭️ โหวตข้ามแล้ว **{len(votes)}/{required}** เสียง",
+            delete_after=8,
+        )
+
+    bot.skip_votes.pop(ctx.guild.id, None)
+    await vc.skip(force=True)
+    await ctx.send("⏭️ คะแนนโหวตครบ ข้ามเพลงแล้วครับ", delete_after=5)
+
+
+@bot.command(name='forceskip', aliases=['fs'])
+@commands.has_guild_permissions(manage_guild=True)
+async def force_skip(ctx: commands.Context):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc or not vc.playing:
+        return await ctx.send("❌ ไม่มีเพลงให้ข้ามครับ")
+    bot.skip_votes.pop(ctx.guild.id, None)
+    await vc.skip(force=True)
+    await ctx.send("⏭️ ผู้ดูแลข้ามเพลงแล้วครับ", delete_after=5)
 
 @bot.command(name='pause')
 async def pause(ctx: commands.Context):
@@ -2310,6 +2496,110 @@ async def resume(ctx: commands.Context):
         await vc.pause(False)
         msg = await ctx.send("▶️ ปลดล็อค! เล่นเพลงต่อแล้ว!")
         await msg.delete(delay=5)
+
+
+@bot.command(name='volume', aliases=['vol'])
+async def volume(ctx: commands.Context, level: int | None = None):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc:
+        return await ctx.send("❌ บอทยังไม่ได้อยู่ในห้องเสียงครับ")
+    if level is None:
+        return await ctx.send(f"🔊 ระดับเสียงปัจจุบัน **{vc.volume}%**")
+    if not 0 <= level <= 150:
+        return await ctx.send("❌ ระดับเสียงต้องอยู่ระหว่าง 0-150 ครับ")
+    await vc.set_volume(level)
+    await ctx.send(f"🔊 ตั้งระดับเสียงเป็น **{level}%** แล้วครับ", delete_after=6)
+
+
+@bot.command(name='loop', aliases=['repeat'])
+async def loop_mode(ctx: commands.Context, mode: str = "status"):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc:
+        return await ctx.send("❌ บอทยังไม่ได้อยู่ในห้องเสียงครับ")
+
+    normalized = mode.casefold()
+    modes = {
+        "off": wavelink.QueueMode.normal,
+        "ปิด": wavelink.QueueMode.normal,
+        "track": wavelink.QueueMode.loop,
+        "song": wavelink.QueueMode.loop,
+        "เพลง": wavelink.QueueMode.loop,
+        "queue": wavelink.QueueMode.loop_all,
+        "all": wavelink.QueueMode.loop_all,
+        "คิว": wavelink.QueueMode.loop_all,
+    }
+    if normalized in ("status", "สถานะ"):
+        return await ctx.send(f"🔁 โหมดวนปัจจุบัน: **{queue_mode_name(vc.queue)}**")
+    if normalized not in modes:
+        return await ctx.send("ใช้ `!loop off`, `!loop track` หรือ `!loop queue` ครับ")
+
+    vc.queue.mode = modes[normalized]
+    if vc.queue.mode is wavelink.QueueMode.loop and vc.current:
+        vc.queue._loaded = vc.current
+    await ctx.send(f"🔁 ตั้งโหมดวนเป็น **{queue_mode_name(vc.queue)}** แล้วครับ", delete_after=7)
+
+
+@bot.command(name='shuffle', aliases=['mix'])
+async def shuffle_queue(ctx: commands.Context):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc or vc.queue.count < 2:
+        return await ctx.send("❌ ต้องมีเพลงในคิวอย่างน้อย 2 เพลงครับ")
+    vc.queue.shuffle()
+    write_player_status(vc)
+    await ctx.send(f"🔀 สุ่มลำดับเพลงในคิวแล้ว **{vc.queue.count} เพลง**", delete_after=7)
+
+
+@bot.command(name='remove', aliases=['rm'])
+async def remove_from_queue(ctx: commands.Context, position: int):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc or vc.queue.is_empty:
+        return await ctx.send("❌ ไม่มีเพลงอยู่ในคิวครับ")
+    index = position - 1
+    if index < 0 or index >= vc.queue.count:
+        return await ctx.send(f"❌ เลือกลำดับ 1-{vc.queue.count} ครับ")
+    track = vc.queue.get_at(index)
+    vc.queue.delete(index)
+    write_player_status(vc)
+    await ctx.send(f"🗑️ ลบ **{track.title}** ออกจากคิวแล้วครับ", delete_after=8)
+
+
+@bot.command(name='nowplaying', aliases=['np', 'now'])
+async def now_playing(ctx: commands.Context):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc or not vc.current:
+        return await ctx.send("❌ ตอนนี้ยังไม่มีเพลงกำลังเล่นครับ")
+
+    track = vc.current
+    position = int(getattr(vc, "position", 0) or 0)
+    length = int(getattr(track, "length", 0) or 0)
+    progress = playback_progress_bar(position, length)
+    duration = "LIVE" if getattr(track, "is_stream", False) else format_milliseconds(length)
+    embed = discord.Embed(title="🎵 กำลังเล่น", color=0xffa500)
+    embed.description = (
+        f"**{trim_discord_label(track.title, 180)}**\n"
+        f"โดย {trim_discord_label(getattr(track, 'author', 'Unknown'), 120)}\n\n"
+        f"`{format_milliseconds(position)} {progress} {duration}`\n"
+        f"เสียง **{vc.volume}%** | Loop **{queue_mode_name(vc.queue)}**"
+    )
+    artwork = getattr(track, "artwork", None)
+    if artwork:
+        embed.set_thumbnail(url=artwork)
+    await ctx.send(embed=embed)
 
 @bot.command(name='queue', aliases=['q'])
 async def show_queue(ctx: commands.Context):
@@ -2354,6 +2644,87 @@ async def clear_queue(ctx: commands.Context):
     msg = await ctx.send("🧹 ล้างบางคิวเพลงที่รออยู่ทั้งหมดเรียบร้อยแล้ว!")
     await msg.delete(delay=5)
 
+
+@bot.command(name='lyrics', aliases=['lyric'])
+async def lyrics(ctx: commands.Context):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc or not vc.current:
+        return await ctx.send("❌ ตอนนี้ยังไม่มีเพลงสำหรับค้นหาเนื้อเพลงครับ")
+
+    loading = await ctx.send("🔎 กำลังค้นหาเนื้อเพลง...")
+    payload = await fetch_player_lyrics(vc)
+    await safe_delete_message(loading)
+    text = lyrics_text(payload or {})
+    if not text:
+        return await ctx.send("ไม่พบเนื้อเพลงสำหรับเพลงนี้ครับ", delete_after=10)
+
+    limit = 3800
+    truncated = len(text) > limit
+    shown = text[:limit].rsplit("\n", 1)[0] if truncated else text
+    embed = discord.Embed(
+        title=f"🎤 {trim_discord_label(vc.current.title, 180)}",
+        description=shown,
+        color=0xffa500,
+    )
+    source = payload.get("source")
+    footer = f"Source: {source}" if source else "Lyrics"
+    if truncated:
+        footer += " | เนื้อเพลงยาวเกินไป จึงแสดงเฉพาะส่วนแรก"
+    embed.set_footer(text=footer)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='sponsorblock', aliases=['sb'])
+async def sponsorblock(ctx: commands.Context, mode: str = "status"):
+    if not should_handle_music_command(ctx):
+        return
+
+    vc: wavelink.Player = ctx.voice_client
+    if not vc:
+        return await ctx.send("❌ บอทยังไม่ได้อยู่ในห้องเสียงครับ")
+
+    current = bot.sponsorblock_enabled.get(ctx.guild.id, True)
+    normalized = mode.casefold()
+    if normalized in ("status", "สถานะ"):
+        state = "เปิด" if current else "ปิด"
+        return await ctx.send(f"SponsorBlock กำลัง **{state}** อยู่ครับ")
+
+    if not ctx.author.guild_permissions.manage_guild:
+        return await ctx.send("❌ เฉพาะผู้ดูแลเซิร์ฟเวอร์ที่เปิดหรือปิด SponsorBlock ได้ครับ")
+    if normalized not in ("on", "off", "เปิด", "ปิด"):
+        return await ctx.send("ใช้ `!sponsorblock on` หรือ `!sponsorblock off` ครับ")
+
+    enabled = normalized in ("on", "เปิด")
+    if not await configure_sponsorblock(vc, enabled):
+        return await ctx.send("❌ ติดต่อ SponsorBlock plugin ไม่สำเร็จครับ")
+    bot.sponsorblock_enabled[ctx.guild.id] = enabled
+    state = "เปิด" if enabled else "ปิด"
+    await ctx.send(f"SponsorBlock **{state}** แล้วครับ", delete_after=7)
+
+
+@bot.command(name='musichelp', aliases=['mhelp'])
+async def music_help(ctx: commands.Context):
+    embed = discord.Embed(title="🎵 คำสั่งบอทเพลง", color=0xffa500)
+    embed.description = (
+        "`!play <ชื่อ/ลิงก์>` เปิดเพลงหรือเพิ่ม Playlist\n"
+        "`!queue` ดูและเลือกเพลงในคิว\n"
+        "`!nowplaying` ดูเพลง เวลา เสียง และโหมดวน\n"
+        "`!pause` / `!resume` หยุดชั่วคราวหรือเล่นต่อ\n"
+        "`!volume 0-150` ปรับระดับเสียง\n"
+        "`!loop off|track|queue` ตั้งการวนเพลง\n"
+        "`!shuffle` สุ่มคิวเพลง\n"
+        "`!remove <ลำดับ>` ลบเพลงจากคิว\n"
+        "`!skip` โหวตข้ามเพลง\n"
+        "`!lyrics` แสดงเนื้อเพลง\n"
+        "`!sponsorblock` ดูสถานะการข้ามสปอนเซอร์\n"
+        "`!clear` ล้างคิว | `!stop` ล้างคิวและให้บอทออก"
+    )
+    embed.set_footer(text="ผู้ดูแลใช้ !forceskip และเปิด/ปิด SponsorBlock ได้")
+    await ctx.send(embed=embed)
+
 @bot.command(name='stop')
 async def stop(ctx: commands.Context):
     if not should_handle_music_command(ctx):
@@ -2380,9 +2751,12 @@ async def on_wavelink_track_start(payload: wavelink.TrackStartEventPayload):
     if retry_state and retry_state.get("track_key") != track_identity(getattr(payload, "track", None)):
         clear_transient_track_retry(player)
     if guild:
+        bot.skip_votes.pop(guild.id, None)
         bot.player_last_update[guild.id] = time.monotonic()
         bot.player_unhealthy_since.pop(guild.id, None)
         remember_player_position(player, 0)
+        enabled = bot.sponsorblock_enabled.get(guild.id, True)
+        await configure_sponsorblock(player, enabled)
     write_player_status(player)
 
 @bot.event
@@ -2397,7 +2771,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEndEventPayload):
         return
 
     reason = str(getattr(payload, "reason", "finished"))
-    if not player.queue.is_empty:
+    if queue_has_next_track(player.queue):
         await recover_player(player, reason=f"track_end: {reason}")
         return
 

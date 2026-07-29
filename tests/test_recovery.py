@@ -19,6 +19,9 @@ class FakeTrack:
 class FakeQueue:
     def __init__(self, *tracks):
         self.tracks = list(tracks)
+        self.mode = main.wavelink.QueueMode.normal
+        self.loaded = None
+        self.history = None
 
     @property
     def is_empty(self):
@@ -164,6 +167,31 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(main.is_voice_connect_timeout(channel_timeout()))
         self.assertTrue(main.is_voice_connect_timeout(TimeoutError()))
         self.assertFalse(main.is_voice_connect_timeout(RuntimeError()))
+
+    def test_loop_mode_has_a_next_track_when_queue_is_empty(self):
+        queue = FakeQueue()
+        queue.mode = main.wavelink.QueueMode.loop
+        queue.loaded = FakeTrack("current")
+
+        self.assertTrue(main.queue_has_next_track(queue))
+
+    def test_loop_all_uses_queue_history(self):
+        queue = FakeQueue()
+        queue.mode = main.wavelink.QueueMode.loop_all
+        queue.history = FakeQueue(FakeTrack("played"))
+
+        self.assertTrue(main.queue_has_next_track(queue))
+
+    def test_progress_bar_and_time_formatting(self):
+        self.assertEqual(main.format_milliseconds(65_000), "01:05")
+        self.assertEqual(main.playback_progress_bar(50_000, 100_000, width=10), "=====o----")
+
+    def test_lyrics_payload_supports_text_and_timed_lines(self):
+        self.assertEqual(main.lyrics_text({"type": "text", "text": "hello"}), "hello")
+        self.assertEqual(
+            main.lyrics_text({"type": "timed", "lines": [{"line": "one"}, {"line": "two"}]}),
+            "one\ntwo",
+        )
 
     async def test_dead_wavelink_websocket_is_reconnected(self):
         class FakeTask:
