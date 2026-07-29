@@ -1364,7 +1364,7 @@ async def disconnect_empty_voice_player(player, channel, empty_seconds: float):
 
 
 def is_voice_connect_timeout(error: Exception) -> bool:
-    return isinstance(error, asyncio.TimeoutError) or error.__class__.__name__ == "ChannelTimeoutException"
+    return isinstance(error, (asyncio.TimeoutError, TimeoutError)) or error.__class__.__name__ == "ChannelTimeoutException"
 
 
 async def cleanup_stale_voice_connection(guild: discord.Guild):
