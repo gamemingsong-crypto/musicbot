@@ -1873,7 +1873,8 @@ class OreoCloneBot(commands.Bot):
                     try:
                         self.dashboard_msg = await channel.fetch_message(state.get("message_id"))
                         await self.dashboard_msg.edit(view=MusicDashboard())
-                        self.dashboard_last_signature = build_shared_dashboard_embed().description
+                        # Force the recovered message to adopt the latest dashboard layout.
+                        self.dashboard_last_signature = None
                     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                         self.dashboard_msg = None
 
