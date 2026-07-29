@@ -82,6 +82,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         pool_close.assert_awaited_once()
         session.close.assert_awaited_once()
 
+    async def test_dashboard_starts_with_donate_and_has_no_play_help_button(self):
+        view = main.MusicDashboard()
+        custom_ids = [item.custom_id for item in view.children]
+
+        self.assertEqual(custom_ids[0], "donate_btn")
+        self.assertNotIn("play_btn", custom_ids)
+
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")
         queued_one = FakeTrack("queued-1")

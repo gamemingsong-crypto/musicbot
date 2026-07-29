@@ -1829,23 +1829,11 @@ class MusicDashboard(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="เว็บของเรา", style=discord.ButtonStyle.link, url="https://www.khuiai.com/th/profile/Porkhyun"))
 
-    @discord.ui.button(label="ฟังเพลงใหม่", style=discord.ButtonStyle.success, emoji="▶️", custom_id="play_btn")
-    async def play_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await defer_ephemeral_interaction(interaction, "dashboard play help"):
+    @discord.ui.button(label="Donate", style=discord.ButtonStyle.success, emoji="🪙", custom_id="donate_btn")
+    async def donate_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await defer_ephemeral_interaction(interaction, "dashboard donate"):
             return
-
-        help_text = """**🎵 คู่มือคำสั่งบอทเพลง Pork Hyun Radio:**
-`!p` หรือ `!play <ชื่อเพลง / ลิงก์ YouTube / ลิงก์ Spotify>` : เรียกบอทเข้าห้องเสียงเพื่อเปิดเพลง
-รองรับลิงก์ Spotify / Deezer / Apple Music ทั้งเพลงเดี่ยว, อัลบั้ม และเพลย์ลิสต์
-`!q` : เช็คคิวเพลง
-`!skip` : สั่งข้ามเพลงที่กำลังเล่นอยู่ไปฟังเพลงถัดไป
-`!pause` : สั่งหยุดเพลงชั่วคราว (พักเบรก)
-`!resume` : สั่งให้เพลงที่หยุดไว้เล่นต่อจากเดิม
-`!clear` หรือ `!c` : สั่งล้างคิวเพลงทั้งหมด
-`!stop` : สั่งให้บอทหยุดเล่นเพลงและออกจากห้องเสียง
-
-ℹ️ บอทจะถูกจัดสรรให้ประจำห้องเสียงอัตโนมัติ เข้าห้องไหนก็จะมีบอทของห้องนั้นมาเล่นให้"""
-        await send_ephemeral_followup(interaction, "dashboard play help", help_text)
+        await send_ephemeral_followup(interaction, "dashboard donate", "💸 ขอบคุณที่สนับสนุนครับ! สามารถโดเนทได้ที่ห้อง <#1511062155640963072> เลยครับ!")
 
     @discord.ui.button(label="\u0e04\u0e34\u0e27\u0e40\u0e1e\u0e25\u0e07", style=discord.ButtonStyle.primary, emoji="\U0001F4CB", custom_id="queue_btn")
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1872,13 +1860,6 @@ class MusicDashboard(discord.ui.View):
             embed=build_queue_snapshot_embed(bot_index, voice_channel.name),
             view=view,
         )
-
-    @discord.ui.button(label="Donate", style=discord.ButtonStyle.success, emoji="🪙", custom_id="donate_btn")
-    async def donate_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await defer_ephemeral_interaction(interaction, "dashboard donate"):
-            return
-        await send_ephemeral_followup(interaction, "dashboard donate", "💸 ขอบคุณที่สนับสนุนครับ! สามารถโดเนทได้ที่ห้อง <#1511062155640963072> เลยครับ!")
-
 
 # ==================== 2. คลาสสถาปัตยกรรมระดับเทพ ====================
 async def close_wavelink_pool():
