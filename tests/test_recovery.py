@@ -3,7 +3,7 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import main
 
@@ -67,6 +67,20 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         main.bot.player_transient_retries.clear()
         main.bot.voice_connect_locks.clear()
         main.bot.node_reconnect_locks.clear()
+
+    async def test_wavelink_http_sessions_are_closed_on_shutdown(self):
+        session = AsyncMock()
+        session.closed = False
+        node = type("FakeNode", (), {"_session": session})()
+
+        with (
+            patch.object(main.wavelink.Pool, "nodes", {"test": node}),
+            patch.object(main.wavelink.Pool, "close", new=AsyncMock()) as pool_close,
+        ):
+            await main.close_wavelink_pool()
+
+        pool_close.assert_awaited_once()
+        session.close.assert_awaited_once()
 
     async def test_replay_current_does_not_consume_queue(self):
         current = FakeTrack("current")

@@ -1881,6 +1881,18 @@ class MusicDashboard(discord.ui.View):
 
 
 # ==================== 2. คลาสสถาปัตยกรรมระดับเทพ ====================
+async def close_wavelink_pool():
+    """Close Wavelink nodes and the HTTP sessions left open by Pool.close()."""
+    nodes = list(wavelink.Pool.nodes.values())
+    try:
+        await wavelink.Pool.close()
+    finally:
+        for node in nodes:
+            session = getattr(node, "_session", None)
+            if session is not None and not session.closed:
+                await session.close()
+
+
 class OreoCloneBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -1980,7 +1992,7 @@ class OreoCloneBot(commands.Bot):
             if loop.is_running():
                 loop.cancel()
         try:
-            await wavelink.Pool.close()
+            await close_wavelink_pool()
         except Exception as error:
             print(f"[shutdown] closing Lavalink sessions failed: {error}")
         await super().close()
