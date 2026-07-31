@@ -27,14 +27,22 @@ async def main():
                     "type": 2,
                     "style": 3,
                     "label": "Donate",
-                    "emoji": {"name": "🪙"},
+                    "emoji": {
+                        "name": "1VIP",
+                        "id": "1515580978376999004",
+                        "animated": True,
+                    },
                     "custom_id": "donate_btn",
                 },
                 {
                     "type": 2,
                     "style": 1,
                     "label": "คิวเพลง",
-                    "emoji": {"name": "📋"},
+                    "emoji": {
+                        "name": "0016",
+                        "id": "1515992571854327908",
+                        "animated": True,
+                    },
                     "custom_id": "queue_btn",
                 },
                 {

@@ -1830,13 +1830,23 @@ class MusicDashboard(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="เว็บของเรา", style=discord.ButtonStyle.link, url="https://www.khuiai.com/th/profile/Porkhyun"))
 
-    @discord.ui.button(label="Donate", style=discord.ButtonStyle.success, emoji="🪙", custom_id="donate_btn")
+    @discord.ui.button(
+        label="Donate",
+        style=discord.ButtonStyle.success,
+        emoji="<a:1VIP:1515580978376999004>",
+        custom_id="donate_btn",
+    )
     async def donate_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await defer_ephemeral_interaction(interaction, "dashboard donate"):
             return
         await send_ephemeral_followup(interaction, "dashboard donate", "💸 ขอบคุณที่สนับสนุนครับ! สามารถโดเนทได้ที่ห้อง <#1511062155640963072> เลยครับ!")
 
-    @discord.ui.button(label="\u0e04\u0e34\u0e27\u0e40\u0e1e\u0e25\u0e07", style=discord.ButtonStyle.primary, emoji="\U0001F4CB", custom_id="queue_btn")
+    @discord.ui.button(
+        label="\u0e04\u0e34\u0e27\u0e40\u0e1e\u0e25\u0e07",
+        style=discord.ButtonStyle.primary,
+        emoji="<a:0016:1515992571854327908>",
+        custom_id="queue_btn",
+    )
     async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await defer_ephemeral_interaction(interaction, "dashboard queue"):
             return
