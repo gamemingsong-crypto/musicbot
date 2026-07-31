@@ -2346,7 +2346,7 @@ async def play(ctx: commands.Context, *, search: str):
             await safe_delete_message(loading_msg)
 
             if added_count == 0:
-                return await ctx.send("❌ หาเพลงจาก Deezer บน YouTube ไม่เจอเลยสักเพลง")
+                return await ctx.send("❌ เพลงจากลิงก์นี้ยังไม่พร้อมให้เล่น กรุณาลองลิงก์อื่นหรือค้นหาด้วยชื่อเพลง")
 
             if kind == "track":
                 await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Deezer เรียบร้อย: **{first_track_title}**")
@@ -2373,7 +2373,7 @@ async def play(ctx: commands.Context, *, search: str):
             await safe_delete_message(loading_msg)
 
             if added_count == 0:
-                return await ctx.send("❌ หาเพลงจาก Apple Music บน YouTube ไม่เจอเลยสักเพลง")
+                return await ctx.send("❌ เพลงจากลิงก์นี้ยังไม่พร้อมให้เล่น กรุณาลองลิงก์อื่นหรือค้นหาด้วยชื่อเพลง")
 
             if kind == "song" or track_id:
                 await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Apple Music เรียบร้อย: **{first_track_title}**")
@@ -2400,7 +2400,7 @@ async def play(ctx: commands.Context, *, search: str):
             await safe_delete_message(loading_msg)
 
             if added_count == 0:
-                return await ctx.send("❌ หาเพลงจาก Spotify บน YouTube ไม่เจอเลยสักเพลง")
+                return await ctx.send("❌ เพลงจากลิงก์นี้ยังไม่พร้อมให้เล่น กรุณาลองลิงก์อื่นหรือค้นหาด้วยชื่อเพลง")
 
             if kind == "track":
                 await ctx.send(f"🎵 เพิ่มเข้าคิวจาก Spotify เรียบร้อย: **{first_track_title}**")
