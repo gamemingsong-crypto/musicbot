@@ -186,12 +186,52 @@ def apple_schema_track_to_info(track: dict, fallback_artist: str = ""):
     }
 
 
-async def fetch_apple_music_page_track_names(session: aiohttp.ClientSession, url: str):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; PorkHyunMusicBot/1.0)"}
-    async with session.get(url, headers=headers) as r:
-        if r.status != 200:
-            raise RuntimeError(f"เปิดหน้า Apple Music ไม่ได้ (status {r.status})")
-        html = await r.text()
+def apple_server_track_to_info(track: dict):
+    artist = track.get("artistName", "")
+    if not artist:
+        subtitle_links = track.get("subtitleLinks") or []
+        if subtitle_links and isinstance(subtitle_links[0], dict):
+            artist = subtitle_links[0].get("title", "")
+
+    duration = track.get("duration")
+    if isinstance(duration, (int, float)):
+        duration = int(duration / 1000)
+    else:
+        duration = parse_iso8601_duration(duration)
+
+    return {
+        "title": track.get("title") or track.get("name", ""),
+        "artist": artist,
+        "duration": duration,
+    }
+
+
+def extract_apple_music_page_track_names(html: str):
+    serialized_match = re.search(
+        r'<script[^>]+id=["\']serialized-server-data["\'][^>]*>\s*(.*?)\s*</script>',
+        html,
+        re.DOTALL,
+    )
+    if serialized_match:
+        try:
+            server_data = json.loads(serialized_match.group(1))
+        except json.JSONDecodeError:
+            server_data = {}
+
+        for page in server_data.get("data", []):
+            sections = page.get("data", {}).get("sections", [])
+            for section in sections:
+                if section.get("itemKind") != "trackLockup":
+                    continue
+                track_infos = [
+                    apple_server_track_to_info(track)
+                    for track in section.get("items", [])
+                    if isinstance(track, dict)
+                    and track.get("contentDescriptor", {}).get("kind") == "song"
+                ]
+                track_infos = [track for track in track_infos if track.get("title")]
+                if track_infos:
+                    return track_infos
 
     matches = re.findall(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>\s*(.*?)\s*</script>',
@@ -210,7 +250,9 @@ async def fetch_apple_music_page_track_names(session: aiohttp.ClientSession, url
         if isinstance(by_artist, dict):
             fallback_artist = by_artist.get("name", "")
         elif isinstance(by_artist, list):
-            fallback_artist = ", ".join(item.get("name", "") for item in by_artist if isinstance(item, dict))
+            fallback_artist = ", ".join(
+                item.get("name", "") for item in by_artist if isinstance(item, dict)
+            )
         elif isinstance(by_artist, str):
             fallback_artist = by_artist
 
@@ -222,7 +264,9 @@ async def fetch_apple_music_page_track_names(session: aiohttp.ClientSession, url
         for track in tracks:
             if not isinstance(track, dict):
                 continue
-            normalized_tracks.append(track.get("item") if isinstance(track.get("item"), dict) else track)
+            normalized_tracks.append(
+                track.get("item") if isinstance(track.get("item"), dict) else track
+            )
 
         track_infos = [
             apple_schema_track_to_info(track, fallback_artist)
@@ -234,6 +278,16 @@ async def fetch_apple_music_page_track_names(session: aiohttp.ClientSession, url
             return track_infos
 
     return []
+
+
+async def fetch_apple_music_page_track_names(session: aiohttp.ClientSession, url: str):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PorkHyunMusicBot/1.0)"}
+    async with session.get(url, headers=headers) as r:
+        if r.status != 200:
+            raise RuntimeError(f"เปิดหน้า Apple Music ไม่ได้ (status {r.status})")
+        html = await r.text()
+
+    return extract_apple_music_page_track_names(html)
 
 
 async def fetch_apple_json(session: aiohttp.ClientSession, url: str):

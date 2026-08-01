@@ -11,6 +11,29 @@ class FakeSearchTrack:
 
 
 class TrackMatchingTests(unittest.TestCase):
+    def test_extracts_tracks_from_current_apple_music_playlist_page(self):
+        html = """
+        <script type="application/json" id="serialized-server-data">
+        {"data":[{"data":{"sections":[
+          {"itemKind":"containerDetailHeaderLockup","items":[]},
+          {"itemKind":"trackLockup","items":[
+            {"title":"Bloody Mary","artistName":"Lady Gaga","duration":244765,
+             "contentDescriptor":{"kind":"song"}},
+            {"title":"Ginger","subtitleLinks":[{"title":"The Artist"}],"duration":180000,
+             "contentDescriptor":{"kind":"song"}}
+          ]}
+        ]}}]}
+        </script>
+        """
+
+        tracks = main.extract_apple_music_page_track_names(html)
+
+        self.assertEqual(len(tracks), 2)
+        self.assertEqual(tracks[0]["title"], "Bloody Mary")
+        self.assertEqual(tracks[0]["artist"], "Lady Gaga")
+        self.assertEqual(tracks[0]["duration"], 244)
+        self.assertEqual(tracks[1]["artist"], "The Artist")
+
     def test_original_audio_scores_above_clean_version(self):
         source = {
             "title": "Example Song",
