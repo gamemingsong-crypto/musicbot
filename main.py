@@ -381,6 +381,49 @@ def normalize_track_text(text: str) -> str:
     return text.strip()
 
 
+def contains_version_marker(text: str, marker: str) -> bool:
+    """Match version labels as complete normalized phrases."""
+    normalized = normalize_track_text(text)
+    return re.search(rf"(?:^|\s){re.escape(marker)}(?:$|\s)", normalized) is not None
+
+
+def score_version_preference(candidate_title: str, wanted_title: str = "") -> int:
+    """Prefer original/explicit releases unless the user requested another edit."""
+    censored_markers = (
+        "clean",
+        "clean edit",
+        "clean version",
+        "censored",
+        "censored version",
+        "radio edit",
+        "radio version",
+        "edited",
+        "edited version",
+        "family friendly",
+        "no profanity",
+        "no swearing",
+        "kidz bop",
+    )
+    preferred_markers = (
+        "explicit",
+        "uncensored",
+        "album version",
+        "original version",
+    )
+
+    score = 0
+    for marker in censored_markers:
+        if (
+            contains_version_marker(candidate_title, marker)
+            and not contains_version_marker(wanted_title, marker)
+        ):
+            score -= 80
+    for marker in preferred_markers:
+        if contains_version_marker(candidate_title, marker):
+            score += 15
+    return score
+
+
 def lavalink_search_queries(track_info: dict):
     title = track_info.get("title", "").strip()
     artist = track_info.get("artist", "").strip()
@@ -446,6 +489,10 @@ def score_youtube_track(candidate, track_info: dict) -> int:
     for word in unwanted_versions:
         if word in combined and word not in spotify_all:
             score -= 18
+
+    # Search providers sometimes rank clean/radio edits above the album version
+    # even when the title and artist otherwise match exactly.
+    score += score_version_preference(candidate_title, wanted_title)
 
     if "official" in combined or "audio" in combined:
         score += 8
@@ -2441,7 +2488,15 @@ async def play(ctx: commands.Context, *, search: str):
                 if not tracks:
                     return await ctx.send("❌ หาเพลงไม่เจอ! ลองเปลี่ยนคำค้นดู")
 
-                view = TrackSearchView(ctx, vc, list(tracks), search)
+                ranked_tracks = sorted(
+                    list(tracks),
+                    key=lambda track: score_version_preference(
+                        getattr(track, "title", ""),
+                        search,
+                    ),
+                    reverse=True,
+                )
+                view = TrackSearchView(ctx, vc, ranked_tracks, search)
                 view.message = await ctx.send(embed=view.make_embed(), view=view)
                 return
 
